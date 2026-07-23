@@ -1,20 +1,25 @@
 {
   "version": "0.2",
-  "language": "en,zh,pt",
+  "language": "en,pt-BR,zh-CN",
 
-  "useGitignore": true,
+  "dictionaries": [
+    "en_US",
+    "pt_BR",
+    "zh_CN"
+  ],
 
-  "words": [
-    "camera",
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/.git/**"
+  ],
+
+  "ignoreWords": [
+    "camera_id",
     "CUDA",
     "NVIDIA",
     "ProdX",
     "UNITX"
   ],
 
-  "ignoreRegExpList": [
-    "/[A-Z_]+/",
-    "/\\{.*?\\}/",
-    "/\\/[^ ]+/"
-  ]
+  "useGitignore": true
 }

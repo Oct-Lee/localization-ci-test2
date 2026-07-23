@@ -1,9 +1,14 @@
 name: Localization Quality Gate
 
+
 on:
+
   push:
     branches:
       - main
+
+  workflow_dispatch:
+
 
 
 permissions:
@@ -15,75 +20,99 @@ permissions:
 jobs:
 
 
-  localization:
+  localization-check:
 
 
-    runs-on:
+    name: ${{ matrix.check }}
 
-      ubuntu-latest
+    runs-on: ubuntu-latest
+
+
+    strategy:
+
+      fail-fast: false
+
+      matrix:
+
+        check:
+
+          - cspell
+
+          - languagetool
 
 
 
     steps:
 
 
-    - name: Checkout
+      - name: Checkout
 
-      uses: actions/checkout@v4
-
-      with:
-
-        fetch-depth: 2
+        uses: actions/checkout@v4
 
 
 
-    - name: Install cspell
+      ####################################
+      # Spell Check
+      ####################################
 
-      run: |
+      - name: Install cspell
 
-        npm install -g cspell
+        if: matrix.check == 'cspell'
 
-        npm install \
-        @cspell/dict-zh \
-        @cspell/dict-pt
+        run: |
 
-
-
-    - name: Spell check
-
-      run: |
-
-        cspell \
-        "test.py" \
-        "test.sh" \
-        --config .cspell.json
+          npm install -g \
+          cspell \
+          @cspell/dict-en-us \
+          @cspell/dict-pt-br \
+          @cspell/dict-zh
 
 
 
-    - name: Start LanguageTool
+      - name: Run cspell
 
-      run: |
+        if: matrix.check == 'cspell'
 
-        docker run \
-        -d \
-        --name lt \
-        -p 8010:8010 \
-        erikvl87/languagetool:latest
+        run: |
 
 
-
-    - name: Wait LanguageTool
-
-      run: |
-
-        sleep 30
+          cspell \
+          "**/*.{py,sh,cpp,h,json,yaml,md}" \
+          --config .cspell.json
 
 
 
-    - name: Grammar check
+      ####################################
+      # Grammar Check
+      ####################################
 
-      run: |
+      - name: Install LanguageTool
 
-        pip install requests
+        if: matrix.check == 'languagetool'
 
-        python3 scripts/languagetool_check.py
+        run: |
+
+
+          sudo apt update
+
+          sudo apt install -y \
+          default-jre
+
+
+
+          wget -q \
+          https://languagetool.org/download/LanguageTool-stable.zip
+
+
+          unzip -q LanguageTool-stable.zip
+
+
+
+      - name: Run LanguageTool
+
+        if: matrix.check == 'languagetool'
+
+        run: |
+
+
+          python3 scripts/languagetool_check.py
