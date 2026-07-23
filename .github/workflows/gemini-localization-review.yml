@@ -5,12 +5,12 @@ on:
     branches:
       - main
 
-
 permissions:
   contents: read
 
 
 jobs:
+
   gemini-review:
 
     runs-on: ubuntu-latest
@@ -27,89 +27,81 @@ jobs:
       - name: Get changed diff
         run: |
           git diff HEAD~1 HEAD > pr.diff
-
-          echo "========== DIFF =========="
+          echo "====== DIFF ======"
           cat pr.diff
 
 
       - name: Call Gemini API
-
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
         run: |
 
-          python3 <<'EOF'
+          pip install requests
+
+          python3 <<'PYTHON'
 
           import os
           import requests
 
 
-          api_key=os.environ["GEMINI_API_KEY"]
+          key = os.environ["GEMINI_API_KEY"]
 
 
-          diff=open(
+          with open(
               "pr.diff",
               encoding="utf-8"
-          ).read()
+          ) as f:
+              diff = f.read()
 
 
-          prompt=f"""
-You are a localization quality reviewer.
+          prompt = """
+          Review this localization text.
 
-Check this code diff:
+          Check:
 
-1. English grammar
-2. English spelling
-3. Chinese wording
-4. Portuguese wording
-5. User-facing message quality
+          1. English grammar
+          2. English spelling
+          3. Chinese wording
+          4. Portuguese wording
 
+          Diff:
 
-Return:
-
-Problem:
-Reason:
-Suggestion:
+          """ + diff
 
 
-Diff:
-
-{diff}
-"""
-
-
-          url=(
-          "https://generativelanguage.googleapis.com/"
-          "v1beta/models/"
-          "gemini-2.5-flash:generateContent"
-          f"?key={api_key}"
+          url = (
+              "https://generativelanguage.googleapis.com/"
+              "v1beta/models/"
+              "gemini-2.0-flash:generateContent"
+              f"?key={key}"
           )
 
 
-          response=requests.post(
+          r = requests.post(
               url,
               json={
-                "contents":[
-                  {
-                    "parts":[
+                  "contents": [
                       {
-                        "text":prompt
+                          "parts": [
+                              {
+                                  "text": prompt
+                              }
+                          ]
                       }
-                    ]
-                  }
-                ]
-              }
+                  ]
+              },
+              timeout=60
           )
 
 
-          response.raise_for_status()
+          r.raise_for_status()
 
 
-          result=response.json()
+          result = r.json()
 
 
-          text=(
+          output = (
               result["candidates"][0]
               ["content"]
               ["parts"][0]
@@ -117,17 +109,18 @@ Diff:
           )
 
 
-          print(text)
+          print(output)
 
 
-          open(
+          with open(
               "gemini-result.md",
               "w",
               encoding="utf-8"
-          ).write(text)
+          ) as f:
+              f.write(output)
 
 
-          EOF
+          PYTHON
 
 
       - name: Show Gemini Result

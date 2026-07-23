@@ -47,5 +47,5 @@ logger.error(
 
 
 logger.info(
-    "Starvt NVIDIA CUDA pipeline"
+    "Start NVIDIA CUDA pipeline"
 )
