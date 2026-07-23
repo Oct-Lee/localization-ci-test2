@@ -7,7 +7,6 @@ on:
       - main
 
 
-# Cancel previous running jobs when new commit is pushed
 concurrency:
   group: gemini-localization-review-${{ github.ref }}
   cancel-in-progress: true
@@ -28,323 +27,48 @@ jobs:
 
     steps:
 
-
       - name: Checkout
-
         uses: actions/checkout@v4
-
         with:
           fetch-depth: 2
 
 
-
       - name: Get changed diff
-
         run: |
 
           git diff HEAD~1 HEAD > pr.diff
-
-          echo "========== DIFF =========="
 
           cat pr.diff
 
 
 
-      - name: Call Gemini API
-
-        env:
-
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
+      - name: Install dependency
 
         run: |
-
 
           pip install requests
 
 
 
-          python3 <<'PYTHON'
+      - name: Run Gemini Review
 
+        env:
 
-          import os
-          import time
-          import requests
-
-
-
-          api_key = os.environ.get(
-              "GEMINI_API_KEY"
-          )
-
-
-          if not api_key:
-
-              raise Exception(
-                  "GEMINI_API_KEY is missing"
-              )
-
-
-
-          with open(
-              "pr.diff",
-              encoding="utf-8"
-          ) as f:
-
-              diff = f.read()
-
-
-
-          if not diff.strip():
-
-              print(
-                  "No changes detected."
-              )
-
-              exit(0)
-
-
-
-          # Limit diff size
-
-          if len(diff) > 8000:
-
-              diff = diff[:8000]
-
-              print(
-                  "Diff truncated to 8000 chars"
-              )
-
-
-
-          prompt = f"""
-
-You are a localization quality reviewer.
-
-
-Review this code diff.
-
-
-Check:
-
-1. English spelling
-2. English grammar
-3. English natural expression
-4. Chinese wording quality
-5. Portuguese wording quality
-6. User-facing message professionalism
-
-
-Only report real issues.
-
-Return format:
-
-
-## Problems
-
-### Issue 1
-
-Location:
-(filename or code line if available)
-
-
-Problem:
-
-Reason:
-
-
-Suggested correction:
-
-
-
-Code diff:
-
-{diff}
-
-"""
-
-
-
-          url = (
-
-              "https://generativelanguage.googleapis.com/"
-
-              "v1beta/models/"
-
-              "gemini-3.1-flash-lite:generateContent"
-
-              f"?key={api_key}"
-
-          )
-
-
-
-          response = None
-
-
-
-          for retry in range(3):
-
-
-              print(
-                  f"Gemini request attempt {retry + 1}"
-              )
-
-
-              response = requests.post(
-
-                  url,
-
-                  json={
-
-                      "contents": [
-
-                          {
-
-                              "parts": [
-
-                                  {
-
-                                      "text": prompt
-
-                                  }
-
-                              ]
-
-                          }
-
-                      ]
-
-                  },
-
-                  timeout=60
-
-              )
-
-
-
-              print(
-                  "HTTP Status:",
-                  response.status_code
-              )
-
-
-
-              if response.status_code == 200:
-
-                  break
-
-
-
-              print(
-                  response.text
-              )
-
-
-
-              if response.status_code == 429:
-
-
-                  wait = 10 * (retry + 1)
-
-
-                  print(
-                      f"Rate limited, wait {wait}s"
-                  )
-
-
-                  time.sleep(wait)
-
-
-              else:
-
-                  break
-
-
-
-
-          if response.status_code != 200:
-
-
-              raise Exception(
-
-                  "Gemini API failed:\n"
-
-                  + response.text
-
-              )
-
-
-
-          result = response.json()
-
-
-
-          output = (
-
-              result
-
-              ["candidates"]
-
-              [0]
-
-              ["content"]
-
-              ["parts"]
-
-              [0]
-
-              ["text"]
-
-          )
-
-
-
-          print(
-              output
-          )
-
-
-
-          with open(
-
-              "gemini-result.md",
-
-              "w",
-
-              encoding="utf-8"
-
-          ) as f:
-
-              f.write(
-                  output
-              )
-
-
-
-          PYTHON
-
-
-
-
-      - name: Show Gemini Result
-
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
         run: |
 
+          python3 scripts/gemini_review.py
+
+
+
+      - name: Show Result
+
+        run: |
 
           echo "## 🤖 Gemini Localization Review" \
-
           >> $GITHUB_STEP_SUMMARY
-
-
-
-          echo "" \
-
-          >> $GITHUB_STEP_SUMMARY
-
 
 
           cat gemini-result.md \
-
           >> $GITHUB_STEP_SUMMARY
