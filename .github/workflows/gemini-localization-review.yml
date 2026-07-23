@@ -1,15 +1,13 @@
 name: Gemini Localization Review
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
+  push:
+    branches:
+      - main
+
 
 permissions:
   contents: read
-  pull-requests: write
 
 
 jobs:
@@ -17,24 +15,25 @@ jobs:
 
     runs-on: ubuntu-latest
 
+
     steps:
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
 
-      - name: Get PR diff
-        id: diff
+      - name: Get changed diff
         run: |
-          git diff \
-          ${{ github.event.pull_request.base.sha }} \
-          ${{ github.event.pull_request.head.sha }} \
-          > pr.diff
+          git diff HEAD~1 HEAD > pr.diff
+
+          echo "========== DIFF =========="
+          cat pr.diff
 
 
       - name: Call Gemini API
+
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
@@ -44,7 +43,6 @@ jobs:
 
           import os
           import requests
-          import json
 
 
           api_key=os.environ["GEMINI_API_KEY"]
@@ -57,31 +55,28 @@ jobs:
 
 
           prompt=f"""
-          You are a localization quality reviewer.
+You are a localization quality reviewer.
 
-          Review the following GitHub PR diff.
+Check this code diff:
 
-          Check:
-
-          1. English grammar
-          2. English spelling
-          3. Chinese wording
-          4. Portuguese wording
-          5. User-facing message quality
+1. English grammar
+2. English spelling
+3. Chinese wording
+4. Portuguese wording
+5. User-facing message quality
 
 
-          Provide:
+Return:
 
-          - Problem
-          - Reason
-          - Suggested correction
+Problem:
+Reason:
+Suggestion:
 
 
-          PR diff:
+Diff:
 
-          {diff}
-
-          """
+{diff}
+"""
 
 
           url=(
@@ -99,7 +94,7 @@ jobs:
                   {
                     "parts":[
                       {
-                       "text":prompt
+                        "text":prompt
                       }
                     ]
                   }
@@ -108,18 +103,21 @@ jobs:
           )
 
 
+          response.raise_for_status()
+
+
           result=response.json()
 
 
-          text=result[
-              "candidates"
-          ][0][
-              "content"
-          ][
-              "parts"
-          ][0][
-              "text"
-          ]
+          text=(
+              result["candidates"][0]
+              ["content"]
+              ["parts"][0]
+              ["text"]
+          )
+
+
+          print(text)
 
 
           open(
@@ -129,41 +127,10 @@ jobs:
           ).write(text)
 
 
-          print(text)
-
           EOF
 
 
-      - name: Comment PR
+      - name: Show Gemini Result
 
-        uses: actions/github-script@v7
-
-        with:
-
-          script: |
-
-            const fs=require('fs');
-
-            const body=
-              fs.readFileSync(
-                'gemini-result.md',
-                'utf8'
-              );
-
-
-            github.rest.issues.createComment({
-
-              owner:
-                context.repo.owner,
-
-              repo:
-                context.repo.repo,
-
-              issue_number:
-                context.issue.number,
-
-              body:
-                "## 🤖 Gemini Localization Review\n\n"
-                + body
-
-            });
+        run: |
+          cat gemini-result.md >> $GITHUB_STEP_SUMMARY
