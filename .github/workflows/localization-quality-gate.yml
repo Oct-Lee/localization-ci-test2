@@ -46,11 +46,7 @@ jobs:
 
         run: |
 
-          npm install -g \
-            cspell \
-            @cspell/dict-en-gb \
-            @cspell/dict-zh \
-            @cspell/dict-pt-br
+          npm install -g cspell
 
 
 
