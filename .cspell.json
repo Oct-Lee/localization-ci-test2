@@ -1,12 +1,9 @@
 {
   "version": "0.2",
-  "language": "en,pt-BR,zh-CN",
 
-  "dictionaries": [
-    "en_US",
-    "pt_BR",
-    "zh_CN"
-  ],
+  "language": "en",
+
+  "useGitignore": true,
 
   "ignorePaths": [
     "**/node_modules/**",
@@ -19,7 +16,5 @@
     "NVIDIA",
     "ProdX",
     "UNITX"
-  ],
-
-  "useGitignore": true
+  ]
 }

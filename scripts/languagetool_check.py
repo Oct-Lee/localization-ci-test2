@@ -1,221 +1,274 @@
-import requests
 import subprocess
-import re
+import requests
 import sys
+import os
+
+
+
+LANGUAGETOOL_URL = (
+    "https://api.languagetool.org/v2/check"
+)
+
 
 
 def changed_files():
 
-    result = subprocess.check_output(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            "HEAD~1",
-            "HEAD"
-        ]
-    )
 
-    return [
-        x
-        for x in result.decode().splitlines()
-        if x.endswith(
+    try:
+
+        result = subprocess.check_output(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                "HEAD^",
+                "HEAD"
+            ],
+            text=True
+        )
+
+
+    except subprocess.CalledProcessError:
+
+
+        print(
+            "No previous commit found."
+        )
+
+
+        result = subprocess.check_output(
+            [
+                "git",
+                "ls-files"
+            ],
+            text=True
+        )
+
+
+    files = []
+
+
+    for file in result.splitlines():
+
+        if file.endswith(
             (
                 ".py",
                 ".sh",
-                ".cpp",
-                ".h"
+                ".md",
+                ".txt",
+                ".json",
+                ".yaml",
+                ".yml"
             )
+        ):
+
+            files.append(file)
+
+
+    return files
+
+
+
+
+
+def extract_text(file):
+
+
+    try:
+
+        with open(
+            file,
+            encoding="utf-8"
+        ) as f:
+
+            return f.read()
+
+
+    except Exception:
+
+
+        return ""
+
+
+
+
+
+def check_language(
+    text,
+    language
+):
+
+
+    response = requests.post(
+
+        LANGUAGETOOL_URL,
+
+        data={
+
+            "text": text,
+
+            "language": language
+
+        },
+
+        timeout=60
+
+    )
+
+
+    return response.json()
+
+
+
+
+
+def main():
+
+
+    files = changed_files()
+
+
+    print(
+        "Changed files:"
+    )
+
+
+    for f in files:
+
+        print(
+            f
         )
+
+
+
+    failed = False
+
+
+
+    languages = [
+
+        (
+            "en-US",
+            "English"
+        ),
+
+        (
+            "zh-CN",
+            "Chinese"
+        ),
+
+        (
+            "pt-PT",
+            "Portuguese"
+        )
+
     ]
 
-
-
-def extract_strings(files):
-
-    results=[]
-
-
-    pattern=re.compile(
-        r'"([^"]+)"'
-    )
 
 
     for file in files:
 
 
-        try:
-
-            with open(
-                file,
-                encoding="utf-8"
-            ) as f:
+        text = extract_text(file)
 
 
-                for lineno,line in enumerate(
-                    f,
-                    1
-                ):
+        if not text:
 
-
-                    matches=pattern.findall(
-                        line
-                    )
-
-
-                    for text in matches:
-
-
-                        # ignore paths
-                        if "/" in text:
-                            continue
-
-
-                        # ignore shell variables
-                        if "$" in text:
-                            continue
-
-
-                        results.append(
-                            {
-                                "file":file,
-                                "line":lineno,
-                                "text":text
-                            }
-                        )
-
-
-        except Exception as e:
-
-            print(
-                "Skip",
-                file,
-                e
-            )
-
-
-    return results
+            continue
 
 
 
-files=changed_files()
+        for lang,name in languages:
 
 
-print(
-    "Files:",
-    files
-)
-
-
-texts=extract_strings(
-    files
-)
-
-
-failed=False
-
-
-
-languages=[
-
-    "en-US",
-
-    "zh-CN",
-
-    "pt-PT"
-
-]
-
-
-
-for item in texts:
-
-
-    print(
-        "\nChecking:",
-        item["file"],
-        item["line"]
-    )
-
-
-    print(
-        item["text"]
-    )
-
-
-
-    for lang in languages:
-
-
-        response=requests.post(
-
-            "http://localhost:8010/v2/check",
-
-            data={
-
-                "language":lang,
-
-                "text":item["text"]
-
-            },
-
-            timeout=60
-
-        )
-
-
-        data=response.json()
-
-
-
-        for error in data.get(
-            "matches",
-            []
-        ):
-
-
-            failed=True
-
-
-            print(
-                "Language:",
+            result = check_language(
+                text,
                 lang
             )
 
 
-            print(
-                "Problem:",
-                error["message"]
+            matches = result.get(
+                "matches",
+                []
             )
 
 
-            print(
-                "Context:",
-                error["context"]["text"]
-            )
+            for item in matches:
 
 
-            print(
-                "Suggestion:",
-                [
-                    x["value"]
-                    for x in error.get(
+                failed = True
+
+
+                print(
+                    ""
+                )
+
+
+                print(
+                    "File:",
+                    file
+                )
+
+
+                print(
+                    "Language:",
+                    name
+                )
+
+
+                print(
+                    "Message:",
+                    item.get(
+                        "message"
+                    )
+                )
+
+
+                print(
+                    "Context:",
+                    item.get(
+                        "context",
+                        {}
+                    ).get(
+                        "text"
+                    )
+                )
+
+
+                print(
+                    "Suggestion:",
+                    item.get(
                         "replacements",
                         []
-                    )[:5]
-                ]
-            )
+                    )[:3]
+                )
 
 
 
-if failed:
+    if failed:
 
 
-    sys.exit(
-        1
+        print(
+            ""
+        )
+
+        print(
+            "Localization quality check failed."
+        )
+
+
+        sys.exit(1)
+
+
+
+    print(
+        "Localization quality check passed."
     )
 
 
-print(
-    "\nLocalization check passed"
-)
+
+
+
+if __name__ == "__main__":
+
+    main()

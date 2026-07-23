@@ -4,8 +4,10 @@ name: Localization Quality Gate
 on:
 
   push:
+
     branches:
       - main
+
 
   workflow_dispatch:
 
@@ -23,7 +25,7 @@ jobs:
   localization-check:
 
 
-    name: ${{ matrix.check }}
+    name: ${{ matrix.tool }}
 
     runs-on: ubuntu-latest
 
@@ -34,7 +36,7 @@ jobs:
 
       matrix:
 
-        check:
+        tool:
 
           - cspell
 
@@ -49,46 +51,52 @@ jobs:
 
         uses: actions/checkout@v4
 
+        with:
+
+          fetch-depth: 0
+
 
 
       ####################################
-      # Spell Check
+      #
+      # CSpell
+      #
       ####################################
+
 
       - name: Install cspell
 
-        if: matrix.check == 'cspell'
+        if: matrix.tool == 'cspell'
 
         run: |
 
-          npm install -g \
-          cspell \
-          @cspell/dict-en-us \
-          @cspell/dict-pt-br \
-          @cspell/dict-zh
+          npm install -g cspell
 
 
 
       - name: Run cspell
 
-        if: matrix.check == 'cspell'
+        if: matrix.tool == 'cspell'
 
         run: |
 
 
           cspell \
-          "**/*.{py,sh,cpp,h,json,yaml,md}" \
+          "**/*.{py,sh,md,json,yaml,yml}" \
           --config .cspell.json
 
 
 
       ####################################
-      # Grammar Check
+      #
+      # LanguageTool
+      #
       ####################################
+
 
       - name: Install LanguageTool
 
-        if: matrix.check == 'languagetool'
+        if: matrix.tool == 'languagetool'
 
         run: |
 
@@ -99,18 +107,18 @@ jobs:
           default-jre
 
 
-
           wget -q \
           https://languagetool.org/download/LanguageTool-stable.zip
 
 
-          unzip -q LanguageTool-stable.zip
+          unzip -q \
+          LanguageTool-stable.zip
 
 
 
       - name: Run LanguageTool
 
-        if: matrix.check == 'languagetool'
+        if: matrix.tool == 'languagetool'
 
         run: |
 
