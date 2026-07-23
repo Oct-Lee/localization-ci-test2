@@ -17,7 +17,7 @@ ERROR_MESSAGE = (
 
 
 WARNING_MESSAGE = (
-    "The camera have disconnected"
+    "The cuamera have disconnected"
 )
 
 

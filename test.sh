@@ -11,7 +11,7 @@ fi
 LOCK_FILE="${UNITX_HOME}/prod_run.lock"
 export LOCK_FILE
 if [ -f "$LOCK_FILE" ]; then
-  echo "ProdX run.sh is already running (lock file exists)." >> $LOG_DIR/prod.log
+  echo "ProdX run.sh is already running (locvk file exists)." >> $LOG_DIR/prod.log
   exit 1
 fi
 
