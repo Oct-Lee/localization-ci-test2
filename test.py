@@ -12,12 +12,12 @@ CAMERA_NOT_FOUND_ERROR = (
 
 
 ERROR_MESSAGE = (
-    "camera is not Founded"
+    "camera is not Faounded"
 )
 
 
 WARNING_MESSAGE = (
-    "The cuamera have disconnected"
+    "The camera have disconnected"
 )
 
 

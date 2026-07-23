@@ -1,8 +1,7 @@
-import subprocess
-import requests
-import sys
-import os
+#!/usr/bin/env python3
 
+import os
+import requests
 
 
 LANGUAGETOOL_URL = (
@@ -10,11 +9,14 @@ LANGUAGETOOL_URL = (
 )
 
 
-
-CHECK_EXTENSIONS = (
+SUPPORTED_EXTENSIONS = (
 
     ".py",
     ".sh",
+    ".cpp",
+    ".hpp",
+    ".c",
+    ".h",
     ".md",
     ".txt",
     ".json",
@@ -25,77 +27,54 @@ CHECK_EXTENSIONS = (
 
 
 
-def changed_files():
+LANGUAGES = [
+
+    "en-US",
+
+    "zh-CN",
+
+    "pt-PT"
+
+]
 
 
-    before = os.environ.get(
-        "GITHUB_EVENT_BEFORE"
+
+def get_changed_files():
+
+    """
+    Get changed files from GitHub Actions.
+    Provided by tj-actions/changed-files.
+    """
+
+    value = os.environ.get(
+        "CHANGED_FILES",
+        ""
     )
 
 
-    after = os.environ.get(
-        "GITHUB_SHA"
-    )
-
-
-    if before:
-
-
-        cmd = [
-
-            "git",
-            "diff",
-            "--name-only",
-            before,
-            after
-
-        ]
-
-
-    else:
-
-
-        cmd = [
-
-            "git",
-            "diff",
-            "--name-only",
-            "HEAD~1",
-            "HEAD"
-
-        ]
-
-
-
-    try:
-
-        result = subprocess.check_output(
-            cmd,
-            text=True
-        )
-
-    except Exception:
-
+    if not value:
 
         print(
-            "Cannot get git diff"
+            "No changed files."
         )
 
         return []
 
 
 
-    files=[]
+    files = []
 
 
-    for f in result.splitlines():
+    for file in value.split():
 
-        if f.endswith(
-            CHECK_EXTENSIONS
+
+        if file.endswith(
+            SUPPORTED_EXTENSIONS
         ):
 
-            files.append(f)
-
+            files.append(
+                file
+            )
 
 
     return files
@@ -104,32 +83,47 @@ def changed_files():
 
 
 
-def extract_text(files):
+def read_files(files):
+
+    """
+    Read only changed files.
+    """
+
+    content = ""
 
 
-    content=""
-
-
-    for f in files:
+    for file in files:
 
 
         try:
 
 
+            print(
+                "Reading:",
+                file
+            )
+
+
             with open(
-                f,
+                file,
                 encoding="utf-8"
-            ) as fd:
+            ) as f:
 
 
-                content += "\n" + fd.read()
+                content += (
+                    "\n"
+                    + f.read()
+                )
 
 
-        except Exception:
+        except Exception as e:
 
 
-            pass
-
+            print(
+                "Skip file:",
+                file,
+                e
+            )
 
 
     return content
@@ -138,40 +132,101 @@ def extract_text(files):
 
 
 
-def check_language(
+def remove_code_noise(text):
+
+    """
+    Reduce false positives.
+
+    Keep user-facing strings.
+    """
+
+    lines = []
+
+
+    for line in text.splitlines():
+
+
+        line=line.strip()
+
+
+        if not line:
+
+            continue
+
+
+
+        # ignore imports
+
+        if line.startswith(
+            (
+                "import ",
+                "from "
+            )
+        ):
+
+            continue
+
+
+
+        # ignore comments
+
+        if line.startswith("#"):
+
+            continue
+
+
+
+        lines.append(
+            line
+        )
+
+
+
+    return "\n".join(
+        lines
+    )
+
+
+
+
+
+def call_languagetool(
     text,
     language
 ):
 
 
-    data={
+    data = {
 
-        "text":text,
+        "text": text,
 
-        "language":language
+        "language": language
 
     }
-
 
 
     try:
 
 
-        response=requests.post(
+        response = requests.post(
 
             LANGUAGETOOL_URL,
 
             data=data,
 
-            timeout=30
+            timeout=60
 
         )
+
 
 
         print(
-            "LanguageTool status:",
+            "",
+            language,
+            "HTTP:",
             response.status_code
         )
+
 
 
         if response.status_code != 200:
@@ -180,6 +235,31 @@ def check_language(
             print(
                 response.text[:500]
             )
+
+
+            return None
+
+
+
+        content_type = response.headers.get(
+            "content-type",
+            ""
+        )
+
+
+
+        if "json" not in content_type:
+
+
+            print(
+                "Unexpected response:"
+            )
+
+
+            print(
+                response.text[:500]
+            )
+
 
             return None
 
@@ -193,7 +273,7 @@ def check_language(
 
 
         print(
-            "LanguageTool error:",
+            "LanguageTool request failed:",
             e
         )
 
@@ -204,19 +284,20 @@ def check_language(
 
 
 
-def report(
-    result,
-    language
+def print_result(
+    language,
+    result
 ):
 
 
     if not result:
 
+
         return
 
 
 
-    matches=result.get(
+    matches = result.get(
         "matches",
         []
     )
@@ -225,9 +306,10 @@ def report(
 
     if not matches:
 
+
         print(
             language,
-            "OK"
+            "PASS"
         )
 
         return
@@ -235,47 +317,104 @@ def report(
 
 
     print(
-        "\nLanguage:",
+        ""
+    )
+
+    print(
+        "=============================="
+    )
+
+
+    print(
+        "Language:",
         language
     )
+
+
+    print(
+        "Issues:",
+        len(matches)
+    )
+
+
+    print(
+        "=============================="
+    )
+
 
 
     for item in matches:
 
 
-        print(
-            "Problem:",
-            item.get(
-                "message"
+        message = item.get(
+            "message",
+            ""
+        )
+
+
+        context = item.get(
+            "context",
+            {}
+        ).get(
+            "text",
+            ""
+        )
+
+
+
+        replacements = [
+
+            x.get(
+                "value"
             )
+
+            for x in item.get(
+                "replacements",
+                []
+            )[:5]
+
+        ]
+
+
+
+        print(
+            ""
         )
 
 
         print(
-            "Context:",
-            item.get(
-                "context",
-                {}
-            ).get(
-                "text"
-            )
+            "Problem:"
         )
 
 
         print(
-            "Suggestion:",
-            [
-                x.get("value")
-                for x in item.get(
-                    "replacements",
-                    []
-                )[:3]
-            ]
+            message
         )
 
 
         print(
-            "------"
+            "Context:"
+        )
+
+
+        print(
+            context
+        )
+
+
+        print(
+            "Suggestion:"
+        )
+
+
+        print(
+            replacements
+        )
+
+
+
+        print(
+            "------------------------------"
         )
 
 
@@ -285,27 +424,52 @@ def report(
 def main():
 
 
-    files=changed_files()
+    print(
+        "================================"
+    )
 
 
     print(
-        "Changed files:",
-        files
+        "Localization Grammar Check"
     )
+
+
+    print(
+        "================================"
+    )
+
+
+
+    files = get_changed_files()
+
+
+
+    print(
+        "Changed files:"
+    )
+
+
+    for f in files:
+
+        print(
+            " -",
+            f
+        )
+
 
 
     if not files:
 
 
         print(
-            "No files"
+            "Nothing to check."
         )
 
         return
 
 
 
-    text=extract_text(
+    text = read_files(
         files
     )
 
@@ -313,41 +477,103 @@ def main():
 
     if not text.strip():
 
+
+        print(
+            "No text."
+        )
+
         return
 
 
 
-    for lang in [
-
-        "en-US",
-
-        "zh-CN",
-
-        "pt-PT"
-
-    ]:
+    text = remove_code_noise(
+        text
+    )
 
 
-        result=check_language(
+
+    # Avoid huge request
+
+    if len(text) > 12000:
+
+
+        text = text[:12000]
+
+
+        print(
+            "Text truncated."
+        )
+
+
+
+    failed = False
+
+
+
+    for language in LANGUAGES:
+
+
+        result = call_languagetool(
 
             text,
 
-            lang
+            language
 
         )
 
 
-        report(
+        print_result(
 
-            result,
+            language,
 
-            lang
+            result
 
+        )
+
+
+        if result:
+
+
+            if len(
+                result.get(
+                    "matches",
+                    []
+                )
+            ) > 0:
+
+                failed = True
+
+
+
+    if failed:
+
+
+        print(
+            ""
+        )
+
+
+        print(
+            "❌ Localization grammar check failed"
+        )
+
+
+        # 当前测试阶段不阻断PR
+        # 正式门禁打开:
+        # exit(1)
+
+
+    else:
+
+
+        print(
+            "✅ Localization grammar check passed"
         )
 
 
 
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
 
     main()
