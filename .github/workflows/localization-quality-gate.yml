@@ -1,0 +1,93 @@
+name: Localization Quality Gate
+
+
+on:
+
+  pull_request:
+
+    branches:
+      - main
+
+
+
+permissions:
+
+  contents: read
+
+
+
+jobs:
+
+
+  localization:
+
+
+    runs-on:
+
+      ubuntu-latest
+
+
+
+    steps:
+
+
+    - name: Checkout
+
+      uses: actions/checkout@v4
+
+      with:
+
+        fetch-depth: 2
+
+
+
+    - name: Install cspell
+
+      run: |
+
+        npm install -g cspell
+
+        npm install \
+        @cspell/dict-zh \
+        @cspell/dict-pt
+
+
+
+    - name: Spell check
+
+      run: |
+
+        cspell \
+        "test.py" \
+        "test.sh" \
+        --config .cspell.json
+
+
+
+    - name: Start LanguageTool
+
+      run: |
+
+        docker run \
+        -d \
+        --name lt \
+        -p 8010:8010 \
+        erikvl87/languagetool:latest
+
+
+
+    - name: Wait LanguageTool
+
+      run: |
+
+        sleep 30
+
+
+
+    - name: Grammar check
+
+      run: |
+
+        pip install requests
+
+        python3 scripts/languagetool_check.py

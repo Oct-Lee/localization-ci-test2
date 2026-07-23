@@ -1,0 +1,20 @@
+{
+  "version": "0.2",
+  "language": "en,zh,pt",
+
+  "useGitignore": true,
+
+  "words": [
+    "camera",
+    "CUDA",
+    "NVIDIA",
+    "ProdX",
+    "UNITX"
+  ],
+
+  "ignoreRegExpList": [
+    "/[A-Z_]+/",
+    "/\\{.*?\\}/",
+    "/\\/[^ ]+/"
+  ]
+}
