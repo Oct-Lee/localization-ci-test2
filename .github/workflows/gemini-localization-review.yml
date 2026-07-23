@@ -7,6 +7,12 @@ on:
       - main
 
 
+# Cancel previous running jobs when new commit is pushed
+concurrency:
+  group: gemini-localization-review-${{ github.ref }}
+  cancel-in-progress: true
+
+
 permissions:
   contents: read
 
@@ -17,18 +23,23 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    timeout-minutes: 5
+
 
     steps:
 
 
       - name: Checkout
+
         uses: actions/checkout@v4
+
         with:
           fetch-depth: 2
 
 
 
       - name: Get changed diff
+
         run: |
 
           git diff HEAD~1 HEAD > pr.diff
@@ -48,7 +59,9 @@ jobs:
 
         run: |
 
+
           pip install requests
+
 
 
           python3 <<'PYTHON'
@@ -66,6 +79,7 @@ jobs:
 
 
           if not api_key:
+
               raise Exception(
                   "GEMINI_API_KEY is missing"
               )
@@ -81,7 +95,17 @@ jobs:
 
 
 
-          # Limit input size to avoid token quota issue
+          if not diff.strip():
+
+              print(
+                  "No changes detected."
+              )
+
+              exit(0)
+
+
+
+          # Limit diff size
 
           if len(diff) > 8000:
 
@@ -94,41 +118,63 @@ jobs:
 
 
           prompt = f"""
+
 You are a localization quality reviewer.
 
-Review the following code diff.
+
+Review this code diff.
+
 
 Check:
 
 1. English spelling
 2. English grammar
-3. Chinese wording quality
-4. Portuguese wording quality
-5. User-facing message professionalism
+3. English natural expression
+4. Chinese wording quality
+5. Portuguese wording quality
+6. User-facing message professionalism
 
 
-Return:
+Only report real issues.
+
+Return format:
+
 
 ## Problems
 
-- Location
-- Issue
-- Reason
-- Suggested correction
+### Issue 1
+
+Location:
+(filename or code line if available)
+
+
+Problem:
+
+Reason:
+
+
+Suggested correction:
+
 
 
 Code diff:
 
 {diff}
+
 """
 
 
 
           url = (
+
               "https://generativelanguage.googleapis.com/"
+
               "v1beta/models/"
+
               "gemini-3.1-flash-lite:generateContent"
+
               f"?key={api_key}"
+
           )
 
 
@@ -137,9 +183,8 @@ Code diff:
 
 
 
-          # Retry for quota / rate limit
-
           for retry in range(3):
+
 
               print(
                   f"Gemini request attempt {retry + 1}"
@@ -147,20 +192,42 @@ Code diff:
 
 
               response = requests.post(
+
                   url,
+
                   json={
+
                       "contents": [
+
                           {
+
                               "parts": [
+
                                   {
+
                                       "text": prompt
+
                                   }
+
                               ]
+
                           }
+
                       ]
+
                   },
+
                   timeout=60
+
               )
+
+
+
+              print(
+                  "HTTP Status:",
+                  response.status_code
+              )
+
 
 
               if response.status_code == 200:
@@ -170,28 +237,24 @@ Code diff:
 
 
               print(
-                  "Gemini API error:"
-              )
-
-              print(
                   response.text
               )
 
 
+
               if response.status_code == 429:
 
-                  wait_time = (
-                      10 * (retry + 1)
-                  )
+
+                  wait = 10 * (retry + 1)
+
 
                   print(
-                      f"Rate limited. "
-                      f"Retry after {wait_time}s"
+                      f"Rate limited, wait {wait}s"
                   )
 
-                  time.sleep(
-                      wait_time
-                  )
+
+                  time.sleep(wait)
+
 
               else:
 
@@ -199,12 +262,16 @@ Code diff:
 
 
 
+
           if response.status_code != 200:
 
 
               raise Exception(
+
                   "Gemini API failed:\n"
+
                   + response.text
+
               )
 
 
@@ -213,28 +280,23 @@ Code diff:
 
 
 
-          try:
+          output = (
 
-              output = (
-                  result["candidates"][0]
-                  ["content"]
-                  ["parts"][0]
-                  ["text"]
-              )
+              result
 
+              ["candidates"]
 
-          except Exception:
+              [0]
 
+              ["content"]
 
-              print(
-                  "Unexpected Gemini response:"
-              )
+              ["parts"]
 
-              print(
-                  result
-              )
+              [0]
 
-              raise
+              ["text"]
+
+          )
 
 
 
@@ -245,14 +307,19 @@ Code diff:
 
 
           with open(
+
               "gemini-result.md",
+
               "w",
+
               encoding="utf-8"
+
           ) as f:
 
               f.write(
                   output
               )
+
 
 
           PYTHON
@@ -262,11 +329,22 @@ Code diff:
 
       - name: Show Gemini Result
 
+
         run: |
 
+
           echo "## 🤖 Gemini Localization Review" \
+
           >> $GITHUB_STEP_SUMMARY
 
 
+
+          echo "" \
+
+          >> $GITHUB_STEP_SUMMARY
+
+
+
           cat gemini-result.md \
+
           >> $GITHUB_STEP_SUMMARY

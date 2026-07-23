@@ -2,4 +2,4 @@
 
 echo "Camera was not Founded"
 
-echo "Please check the configration filde"
+echo "Please check the configration fild"
