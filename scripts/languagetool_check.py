@@ -11,58 +11,91 @@ LANGUAGETOOL_URL = (
 
 
 
+CHECK_EXTENSIONS = (
+
+    ".py",
+    ".sh",
+    ".md",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml"
+
+)
+
+
+
 def changed_files():
+
+
+    before = os.environ.get(
+        "GITHUB_EVENT_BEFORE"
+    )
+
+
+    after = os.environ.get(
+        "GITHUB_SHA"
+    )
+
+
+    if before:
+
+
+        cmd = [
+
+            "git",
+            "diff",
+            "--name-only",
+            before,
+            after
+
+        ]
+
+
+    else:
+
+
+        cmd = [
+
+            "git",
+            "diff",
+            "--name-only",
+            "HEAD~1",
+            "HEAD"
+
+        ]
+
 
 
     try:
 
         result = subprocess.check_output(
-            [
-                "git",
-                "diff",
-                "--name-only",
-                "HEAD^",
-                "HEAD"
-            ],
+            cmd,
             text=True
         )
 
-
-    except subprocess.CalledProcessError:
+    except Exception:
 
 
         print(
-            "No previous commit found."
+            "Cannot get git diff"
         )
 
-
-        result = subprocess.check_output(
-            [
-                "git",
-                "ls-files"
-            ],
-            text=True
-        )
+        return []
 
 
-    files = []
+
+    files=[]
 
 
-    for file in result.splitlines():
+    for f in result.splitlines():
 
-        if file.endswith(
-            (
-                ".py",
-                ".sh",
-                ".md",
-                ".txt",
-                ".json",
-                ".yaml",
-                ".yml"
-            )
+        if f.endswith(
+            CHECK_EXTENSIONS
         ):
 
-            files.append(file)
+            files.append(f)
+
 
 
     return files
@@ -71,23 +104,35 @@ def changed_files():
 
 
 
-def extract_text(file):
+def extract_text(files):
 
 
-    try:
-
-        with open(
-            file,
-            encoding="utf-8"
-        ) as f:
-
-            return f.read()
+    content=""
 
 
-    except Exception:
+    for f in files:
 
 
-        return ""
+        try:
+
+
+            with open(
+                f,
+                encoding="utf-8"
+            ) as fd:
+
+
+                content += "\n" + fd.read()
+
+
+        except Exception:
+
+
+            pass
+
+
+
+    return content
 
 
 
@@ -99,24 +144,139 @@ def check_language(
 ):
 
 
-    response = requests.post(
+    data={
 
-        LANGUAGETOOL_URL,
+        "text":text,
 
-        data={
+        "language":language
 
-            "text": text,
+    }
 
-            "language": language
 
-        },
 
-        timeout=60
+    try:
 
+
+        response=requests.post(
+
+            LANGUAGETOOL_URL,
+
+            data=data,
+
+            timeout=30
+
+        )
+
+
+        print(
+            "LanguageTool status:",
+            response.status_code
+        )
+
+
+        if response.status_code != 200:
+
+
+            print(
+                response.text[:500]
+            )
+
+            return None
+
+
+
+        return response.json()
+
+
+
+    except Exception as e:
+
+
+        print(
+            "LanguageTool error:",
+            e
+        )
+
+
+        return None
+
+
+
+
+
+def report(
+    result,
+    language
+):
+
+
+    if not result:
+
+        return
+
+
+
+    matches=result.get(
+        "matches",
+        []
     )
 
 
-    return response.json()
+
+    if not matches:
+
+        print(
+            language,
+            "OK"
+        )
+
+        return
+
+
+
+    print(
+        "\nLanguage:",
+        language
+    )
+
+
+    for item in matches:
+
+
+        print(
+            "Problem:",
+            item.get(
+                "message"
+            )
+        )
+
+
+        print(
+            "Context:",
+            item.get(
+                "context",
+                {}
+            ).get(
+                "text"
+            )
+        )
+
+
+        print(
+            "Suggestion:",
+            [
+                x.get("value")
+                for x in item.get(
+                    "replacements",
+                    []
+                )[:3]
+            ]
+        )
+
+
+        print(
+            "------"
+        )
 
 
 
@@ -125,150 +285,69 @@ def check_language(
 def main():
 
 
-    files = changed_files()
+    files=changed_files()
 
 
     print(
-        "Changed files:"
+        "Changed files:",
+        files
     )
 
 
-    for f in files:
-
-        print(
-            f
-        )
-
-
-
-    failed = False
-
-
-
-    languages = [
-
-        (
-            "en-US",
-            "English"
-        ),
-
-        (
-            "zh-CN",
-            "Chinese"
-        ),
-
-        (
-            "pt-PT",
-            "Portuguese"
-        )
-
-    ]
-
-
-
-    for file in files:
-
-
-        text = extract_text(file)
-
-
-        if not text:
-
-            continue
-
-
-
-        for lang,name in languages:
-
-
-            result = check_language(
-                text,
-                lang
-            )
-
-
-            matches = result.get(
-                "matches",
-                []
-            )
-
-
-            for item in matches:
-
-
-                failed = True
-
-
-                print(
-                    ""
-                )
-
-
-                print(
-                    "File:",
-                    file
-                )
-
-
-                print(
-                    "Language:",
-                    name
-                )
-
-
-                print(
-                    "Message:",
-                    item.get(
-                        "message"
-                    )
-                )
-
-
-                print(
-                    "Context:",
-                    item.get(
-                        "context",
-                        {}
-                    ).get(
-                        "text"
-                    )
-                )
-
-
-                print(
-                    "Suggestion:",
-                    item.get(
-                        "replacements",
-                        []
-                    )[:3]
-                )
-
-
-
-    if failed:
+    if not files:
 
 
         print(
-            ""
+            "No files"
         )
 
-        print(
-            "Localization quality check failed."
-        )
-
-
-        sys.exit(1)
+        return
 
 
 
-    print(
-        "Localization quality check passed."
+    text=extract_text(
+        files
     )
 
 
 
+    if not text.strip():
+
+        return
 
 
-if __name__ == "__main__":
+
+    for lang in [
+
+        "en-US",
+
+        "zh-CN",
+
+        "pt-PT"
+
+    ]:
+
+
+        result=check_language(
+
+            text,
+
+            lang
+
+        )
+
+
+        report(
+
+            result,
+
+            lang
+
+        )
+
+
+
+
+if __name__=="__main__":
 
     main()

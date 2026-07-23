@@ -6,11 +6,8 @@ on:
   push:
 
     branches:
+
       - main
-
-
-  workflow_dispatch:
-
 
 
 permissions:
@@ -22,25 +19,96 @@ permissions:
 jobs:
 
 
-  localization-check:
+  ####################################
+  # Spell Check
+  ####################################
 
+  spell-check:
 
-    name: ${{ matrix.tool }}
 
     runs-on: ubuntu-latest
 
 
-    strategy:
+    steps:
 
-      fail-fast: false
 
-      matrix:
+      - name: Checkout
 
-        tool:
+        uses: actions/checkout@v4
 
-          - cspell
+        with:
 
-          - languagetool
+          fetch-depth: 0
+
+
+
+      - name: Install cspell
+
+        run: |
+
+          npm install -g \
+            cspell \
+            @cspell/dict-en-gb \
+            @cspell/dict-zh \
+            @cspell/dict-pt-br
+
+
+
+      - name: Get changed files
+
+        id: files
+
+        run: |
+
+          git diff \
+          --name-only \
+          ${{ github.event.before }} \
+          ${{ github.sha }} \
+          > changed_files.txt
+
+
+          cat changed_files.txt
+
+
+
+      - name: Run cspell
+
+
+        run: |
+
+
+          FILES=$(cat changed_files.txt | \
+          grep -E '\.(py|sh|cpp|hpp|md|json|yaml|yml)$' || true)
+
+
+
+          if [ -z "$FILES" ]; then
+
+              echo "No files to check"
+
+              exit 0
+
+          fi
+
+
+
+          cspell \
+          --config .cspell.json \
+          $FILES
+
+
+
+
+
+  ####################################
+  # Grammar Check
+  ####################################
+
+
+  grammar-check:
+
+
+    runs-on: ubuntu-latest
 
 
 
@@ -57,70 +125,16 @@ jobs:
 
 
 
-      ####################################
-      #
-      # CSpell
-      #
-      ####################################
-
-
-      - name: Install cspell
-
-        if: matrix.tool == 'cspell'
+      - name: Install dependency
 
         run: |
 
-          npm install -g cspell
-
-
-
-      - name: Run cspell
-
-        if: matrix.tool == 'cspell'
-
-        run: |
-
-
-          cspell \
-          "**/*.{py,sh,md,json,yaml,yml}" \
-          --config .cspell.json
-
-
-
-      ####################################
-      #
-      # LanguageTool
-      #
-      ####################################
-
-
-      - name: Install LanguageTool
-
-        if: matrix.tool == 'languagetool'
-
-        run: |
-
-
-          sudo apt update
-
-          sudo apt install -y \
-          default-jre
-
-
-          wget -q \
-          https://languagetool.org/download/LanguageTool-stable.zip
-
-
-          unzip -q \
-          LanguageTool-stable.zip
+          pip install requests
 
 
 
       - name: Run LanguageTool
 
-        if: matrix.tool == 'languagetool'
-
         run: |
-
 
           python3 scripts/languagetool_check.py
