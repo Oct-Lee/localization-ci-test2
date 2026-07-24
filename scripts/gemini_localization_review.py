@@ -11,40 +11,42 @@ with open(diff_file, "r", encoding="utf-8") as f:
     diff = f.read()
 
 
-
 if not diff.strip():
     print("No changes")
     sys.exit(0)
 
 
+# 保留修改上下文
+changed_blocks = []
 
-# 只检查新增代码行
-added_lines = []
+lines = diff.splitlines()
 
+for i, line in enumerate(lines):
 
-for line in diff.splitlines():
-
+    # 找新增代码行
     if line.startswith("+") and not line.startswith("+++"):
-        added_lines.append(line)
+
+        start = max(0, i - 3)
+        end = min(len(lines), i + 4)
+
+        context = lines[start:end]
+
+        changed_blocks.extend(context)
 
 
-
-if not added_lines:
-
+if not changed_blocks:
     print("No added lines")
     sys.exit(0)
 
 
-
-changed_text = "\n".join(added_lines)
-
-
-
-print(
-    "Checking added lines:"
+# 去重，保持顺序
+review_text = "\n".join(
+    dict.fromkeys(changed_blocks)
 )
 
-print(changed_text)
+
+print("===== Code to review =====")
+print(review_text)
 
 
 
@@ -63,29 +65,35 @@ url = (
 prompt = f"""
 You are a professional localization quality reviewer.
 
-Review ONLY the newly added code lines below.
+Review the changed code below.
+
+Only check existing user-facing text.
 
 Check:
 
-1. English grammar
-2. English spelling
-3. Chinese wording quality
-4. Portuguese wording quality
+1. English grammar issues
+2. English spelling issues
+3. Chinese wording quality if Chinese exists
+4. Portuguese wording quality if Portuguese exists
 5. User-facing message professionalism
 
-Rules:
 
-- Ignore variable names
-- Ignore comments unless they are user-facing
-- Only report real localization issues
-- Provide corrected text
+Important rules:
 
-New code:
+- Review only languages that appear in the code.
+- Do NOT report missing translations.
+- Do NOT require every message to have Chinese or Portuguese.
+- Ignore variable names.
+- Ignore code syntax issues.
+- Only report real localization problems.
 
-{changed_text}
+
+Changed code:
+
+{review_text}
 
 
-Output format:
+Return format:
 
 Issue:
 Original:
@@ -116,7 +124,6 @@ response = requests.post(
 data = response.json()
 
 
-
 try:
 
     result = (
@@ -133,23 +140,22 @@ except Exception:
 
 
 
-print(
-    "===== Gemini Result ====="
-)
-
+print("===== Gemini Result =====")
 print(result)
 
 
 
-# 简单门禁
-if "Issue:" in result:
+# 只根据真实 Issue 失败
+if (
+    "Issue:" in result
+    and "No issue" not in result
+):
 
     print(
         "Localization issues detected"
     )
 
     sys.exit(1)
-
 
 
 print(
