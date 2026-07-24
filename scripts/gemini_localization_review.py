@@ -4,53 +4,138 @@ import json
 import requests
 
 
+if len(sys.argv) < 2:
+    print(
+        "Usage: python gemini_localization_review.py <diff_file>"
+    )
+    sys.exit(1)
+
+
 diff_file = sys.argv[1]
 
 
-with open(diff_file, "r", encoding="utf-8") as f:
+with open(
+    diff_file,
+    "r",
+    encoding="utf-8"
+) as f:
+
     diff = f.read()
 
 
+
 if not diff.strip():
-    print("No changes")
+
+    print(
+        "No changes detected"
+    )
+
     sys.exit(0)
 
 
-# 保留修改上下文
-changed_blocks = []
+
+# ==============================
+# Extract changed code context
+# ==============================
 
 lines = diff.splitlines()
 
+
+changed_blocks = []
+
+current_file = ""
+
+
 for i, line in enumerate(lines):
 
-    # 找新增代码行
-    if line.startswith("+") and not line.startswith("+++"):
+    # 获取文件名
+    if line.startswith("+++ b/"):
 
-        start = max(0, i - 3)
-        end = min(len(lines), i + 4)
+        current_file = line.replace(
+            "+++ b/",
+            ""
+        )
+
+
+    # 忽略 CI / script 文件
+    if (
+        current_file.startswith(".github/")
+        or current_file.startswith("scripts/")
+    ):
+        continue
+
+
+    # 只关注新增代码
+    if (
+        line.startswith("+")
+        and not line.startswith("+++")
+    ):
+
+        start = max(
+            0,
+            i - 3
+        )
+
+        end = min(
+            len(lines),
+            i + 4
+        )
+
 
         context = lines[start:end]
 
-        changed_blocks.extend(context)
+
+        changed_blocks.extend(
+            context
+        )
+
 
 
 if not changed_blocks:
-    print("No added lines")
+
+    print(
+        "No user-facing code changes"
+    )
+
     sys.exit(0)
 
 
-# 去重，保持顺序
+
+# 去重保持顺序
+
 review_text = "\n".join(
     dict.fromkeys(changed_blocks)
 )
 
 
-print("===== Code to review =====")
-print(review_text)
+
+print(
+    "===== Code to review ====="
+)
+
+print(
+    review_text
+)
 
 
 
-api_key = os.environ["GEMINI_API_KEY"]
+# ==============================
+# Gemini API
+# ==============================
+
+api_key = os.environ.get(
+    "GEMINI_API_KEY"
+)
+
+
+if not api_key:
+
+    print(
+        "Missing GEMINI_API_KEY"
+    )
+
+    sys.exit(1)
+
 
 
 url = (
@@ -63,34 +148,52 @@ url = (
 
 
 prompt = f"""
-You are a professional localization quality reviewer.
+You are a professional Localization Quality Reviewer.
 
-Review the changed code below.
+Review the following Pull Request code changes.
 
-Only check existing user-facing text.
+Your goal:
+Find problems in user-facing text quality.
+
+Only review:
+
+- UI messages
+- Error messages
+- Exception messages
+- Logs visible to end users
+- Localization resource strings
+
 
 Check:
 
-1. English grammar issues
-2. English spelling issues
-3. Chinese wording quality if Chinese exists
-4. Portuguese wording quality if Portuguese exists
-5. User-facing message professionalism
+1. English grammar
+2. English spelling
+3. Chinese wording quality (only if Chinese exists)
+4. Portuguese wording quality (only if Portuguese exists)
+5. Professional wording quality
 
 
 Important rules:
 
-- Review only languages that appear in the code.
+- Only analyze string literals.
+- Ignore variable names.
+- Ignore function names.
+- Ignore comments.
+- Ignore CI output.
+- Ignore debug messages.
+- Ignore developer-only text.
 - Do NOT report missing translations.
 - Do NOT require every message to have Chinese or Portuguese.
-- Ignore variable names.
-- Ignore code syntax issues.
 - Only report real localization problems.
 
 
 Changed code:
 
+----------------
+
 {review_text}
+
+----------------
 
 
 Return format:
@@ -100,7 +203,13 @@ Original:
 Problem:
 Suggestion:
 Severity:
+
+
+If there are no problems, return exactly:
+
+No localization issues found
 """
+
 
 
 response = requests.post(
@@ -121,7 +230,22 @@ response = requests.post(
 
 
 
+if response.status_code != 200:
+
+    print(
+        "Gemini API failed:"
+    )
+
+    print(
+        response.text
+    )
+
+    sys.exit(1)
+
+
+
 data = response.json()
+
 
 
 try:
@@ -133,22 +257,39 @@ try:
         ["text"]
     )
 
+
 except Exception:
 
-    print(json.dumps(data, indent=2))
+    print(
+        json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False
+        )
+    )
+
     sys.exit(1)
 
 
 
-print("===== Gemini Result =====")
-print(result)
+print(
+    "===== Gemini Result ====="
+)
+
+print(
+    result
+)
 
 
 
-# 只根据真实 Issue 失败
+# ==============================
+# Quality Gate
+# ==============================
+
+
 if (
-    "Issue:" in result
-    and "No issue" not in result
+    "No localization issues found"
+    not in result
 ):
 
     print(
@@ -156,6 +297,7 @@ if (
     )
 
     sys.exit(1)
+
 
 
 print(
