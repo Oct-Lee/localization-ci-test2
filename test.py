@@ -5,14 +5,14 @@ logger = logging.getLogger(__name__)
 
 
 CAMERA_NOT_FOUND_ERROR = (
-    "camera[{camera_id}] not is Founded. "
+    "camera[{camera_id}] not Founded. "
     "Please check whether the "
-    "'camera_id' parameter of the configration fileis correct"
+    "'camera_id' parameter of the configration file is correct"
 )
 
 
 ERROR_MESSAGE = (
-    "camera is not Faounded"
+    "camera is not Founded"
 )
 
 
@@ -22,17 +22,17 @@ WARNING_MESSAGE = (
 
 
 MESSAGE = (
-    "摄像头没有找到，配置请检查文件"
+    "摄像头没有找到，请检查配置文件"
 )
 
 
 CHINESE_ERROR = (
-    "打开无法摄像头社备，请检查摄像头是不是正常"
+    "无法打开摄像头设备，请检查摄像头是不是正常"
 )
 
 
 PORTUGUESE_MESSAGE = (
-    "A camera nvao foi encontrada"
+    "A camera nao foi encontrada"
 )
 
 
@@ -48,7 +48,4 @@ logger.error(
 
 logger.info(
     "Start NVIDIA CUDA pipeline"
-)
-logger.error(
-    "Start jetson device faileds"
 )
