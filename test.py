@@ -49,3 +49,6 @@ logger.error(
 logger.info(
     "Start NVIDIA CUDA pipeline"
 )
+logger.error(
+    "Start jetson device faileds"
+)
