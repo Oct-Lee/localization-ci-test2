@@ -32,7 +32,7 @@ CHINESE_ERROR = (
 
 
 PORTUGUESE_MESSAGE = (
-    "A camera nao foi encontrada"
+    "A camera nvao foi encontrada"
 )
 
 
