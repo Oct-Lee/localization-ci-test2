@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 CAMERA_NOT_FOUND_ERROR = (
     "camera[{camera_id}] not Founded. "
     "Please check whether the "
-    "'camera_id' parameter of the configration fileis correct"
+    "'camera_id' parameter of the configration file is correct"
 )
 
 
@@ -47,5 +47,5 @@ logger.error(
 
 
 logger.info(
-    "Startv NVIDIA CUDA pipeline"
+    "Start NVIDIA CUDA pipeline"
 )
