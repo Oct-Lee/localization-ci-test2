@@ -1,0 +1,59 @@
+name: Gemini Localization Quality Gate
+
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+
+permissions:
+  contents: read
+  pull-requests: write
+
+
+jobs:
+
+  localization-review:
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      - name: Get PR changed lines
+        run: |
+
+          git diff \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            --unified=0 \
+            > pr.diff
+
+
+          echo "===== PR Diff ====="
+          cat pr.diff
+
+
+
+      - name: Install dependency
+        run: |
+          python -m pip install requests
+
+
+
+      - name: Run Gemini localization review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+        run: |
+
+          python scripts/gemini_localization_review.py pr.diff

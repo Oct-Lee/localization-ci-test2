@@ -1,0 +1,157 @@
+name: Localization Quality Gate
+
+
+on:
+
+  pull_request:
+
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+
+permissions:
+
+  contents: read
+
+  pull-requests: write
+
+
+
+jobs:
+
+
+  changed-files:
+
+
+    runs-on: ubuntu-latest
+
+
+    outputs:
+
+      files: ${{ steps.changed.outputs.all_changed_files }}
+
+
+    steps:
+
+
+      - name: Checkout
+
+        uses: actions/checkout@v4
+
+        with:
+
+          fetch-depth: 0
+
+
+
+      - name: Get changed files
+
+        id: changed
+
+        uses: tj-actions/changed-files@v46
+
+        with:
+
+          files: |
+            **/*.py
+            **/*.sh
+            **/*.cpp
+            **/*.hpp
+            **/*.md
+            **/*.json
+            **/*.yaml
+            **/*.yml
+
+
+
+      - name: Show changed files
+
+        run: |
+
+          echo "Changed files:"
+
+          echo "${{ steps.changed.outputs.all_changed_files }}"
+
+
+
+
+  spell-check:
+
+
+    needs: changed-files
+
+
+    if: needs.changed-files.outputs.files != ''
+
+
+    runs-on: ubuntu-latest
+
+
+
+    steps:
+
+
+      - uses: actions/checkout@v4
+
+
+
+      - name: Install cspell
+
+        run: |
+
+          npm install -g cspell
+
+
+
+      - name: Spell check
+
+        run: |
+
+          cspell \
+          ${{ needs.changed-files.outputs.files }}
+
+
+
+
+
+
+  grammar-check:
+
+
+    needs: changed-files
+
+
+    if: needs.changed-files.outputs.files != ''
+
+
+    runs-on: ubuntu-latest
+
+
+
+    steps:
+
+
+      - uses: actions/checkout@v4
+
+
+
+      - name: Install dependency
+
+        run: |
+
+          pip install requests
+
+
+
+      - name: LanguageTool
+
+        env:
+
+          CHANGED_FILES: ${{ needs.changed-files.outputs.files }}
+
+
+        run: |
+
+          python3 scripts/languagetool_check.py
