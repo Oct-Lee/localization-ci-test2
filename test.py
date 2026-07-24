@@ -12,7 +12,7 @@ CAMERA_NOT_FOUND_ERROR = (
 
 
 ERROR_MESSAGE = (
-    "camera is not Founded"
+    "camera not Founded"
 )
 
 
