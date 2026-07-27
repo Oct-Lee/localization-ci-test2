@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 CAMERA_NOT_FOUND_ERROR = (
     "camera[{camera_id}] not is Founded. "
     "Please check whether the "
-    "'camera_id' parameter of the configration file is correct"
+    "'camera_id' parameter of the configrations file is correct"
 )
 
 
