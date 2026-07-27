@@ -179,7 +179,7 @@ Review:
 
 
 Check:
-
++9
 1. English spelling
 2. English grammar
 3. Chinese wording quality if Chinese exists
@@ -217,6 +217,7 @@ Format:
   "has_issue": true,
   "issues": [
     {{
+      "type": "",
       "original": "",
       "problem": "",
       "suggestion": "",
