@@ -9,20 +9,18 @@ import requests
 MAX_RETRY = 3
 
 
-# Spelling / Grammar always block
-BLOCK_TYPES = [
-    "spelling",
-    "grammar"
-]
-
-
 # ======================================
 # Read diff
 # ======================================
 
 if len(sys.argv) < 2:
-    print("Usage: python gemini_localization_review.py <diff_file>")
+
+    print(
+        "Usage: python gemini_localization_review.py <diff_file>"
+    )
+
     sys.exit(1)
+
 
 
 with open(
@@ -30,11 +28,17 @@ with open(
     "r",
     encoding="utf-8"
 ) as f:
+
     diff = f.read()
 
 
+
 if not diff.strip():
-    print("No changes detected")
+
+    print(
+        "No changes detected"
+    )
+
     sys.exit(0)
 
 
@@ -42,6 +46,7 @@ if not diff.strip():
 # ======================================
 # Extract changed lines + context
 # ======================================
+
 
 lines = diff.splitlines()
 
@@ -52,31 +57,45 @@ current_file = ""
 
 for i, line in enumerate(lines):
 
-    if line.startswith("+++ b/"):
+
+    if line.startswith(
+        "+++ b/"
+    ):
+
         current_file = line[6:]
 
+
+
+    # Ignore CI related files
 
     if (
         current_file.startswith(".github/")
         or current_file.startswith("scripts/")
     ):
+
         continue
 
+
+
+    # Only added lines
 
     if (
         line.startswith("+")
         and not line.startswith("+++")
     ):
 
+
         start = max(
             0,
             i - 3
         )
 
+
         end = min(
             len(lines),
             i + 4
         )
+
 
         review_lines.extend(
             lines[start:end]
@@ -85,17 +104,29 @@ for i, line in enumerate(lines):
 
 
 if not review_lines:
-    print("No user-facing changes")
+
+    print(
+        "No user-facing changes"
+    )
+
     sys.exit(0)
 
 
 
 review_text = "\n".join(
     dict.fromkeys(
-        x for x in review_lines
-        if not x.startswith(("---", "+++", "@@"))
+        line
+        for line in review_lines
+        if not line.startswith(
+            (
+                "---",
+                "+++",
+                "@@"
+            )
+        )
     )
 )
+
 
 
 print(
@@ -112,29 +143,39 @@ print(
 # Gemini Prompt
 # ======================================
 
+
 prompt = f"""
+
 You are a professional Localization Quality Reviewer.
 
 Review only user-facing text.
 
+
 Check:
 
-1. English:
+1. English text:
+
 - spelling
 - grammar
 - natural expression
 
-2. Chinese (if exists):
+
+2. Chinese text if exists:
+
 - wording quality
 - sentence fluency
 - punctuation
+- mixed language issues
 
-3. Portuguese (if exists):
+
+3. Portuguese text if exists:
+
 - spelling
 - grammar
 - natural expression
 
-4. Localization quality.
+
+4. General localization quality.
 
 
 Ignore:
@@ -143,8 +184,8 @@ Ignore:
 - function names
 - class names
 - URLs
-- paths
-- debug messages
+- file paths
+- debug-only messages
 
 
 Important:
@@ -158,49 +199,67 @@ Examples:
 %d
 ${{name}}
 
+
 Placeholders are part of user-facing text.
 
-Do NOT remove, change, or omit them.
+Do NOT remove or modify placeholders.
 
 
-Severity:
+Severity rules:
+
 
 HIGH:
+
 - spelling errors
 - grammar errors
 - serious localization problems
 
+
 MEDIUM:
-- wording problems
+
+- wording problems affecting readability
+
 
 LOW:
+
 - capitalization issues
 - style suggestions
 
 
-Rules:
+Important:
 
-- Spelling and Grammar must be HIGH.
-- Capitalization must be LOW.
-- LOW issues do not block.
+- All spelling problems MUST be high severity.
+- All grammar problems MUST be high severity.
+- Capitalization problems MUST be low severity.
+- Low severity issues do not block Pull Request.
 
 
 Return JSON only.
 
+
 Format:
 
+
 {{
- "has_issue": true,
- "issues": [
-  {{
-   "type": "Grammar",
-   "language": "English",
-   "original": "",
-   "problem": "",
-   "suggestion": "",
-   "severity": "high"
-  }}
- ]
+    "has_issue": true,
+
+    "issues": [
+        {{
+            "original": "",
+            "problem": "",
+            "suggestion": "",
+            "severity": "high"
+        }}
+    ]
+}}
+
+
+If no issues:
+
+
+{{
+    "has_issue": false,
+    "issues": []
 }}
 
 
@@ -211,12 +270,15 @@ Changed code:
 {review_text}
 
 ----------------
+
 """
+
 
 
 # ======================================
 # Gemini API
 # ======================================
+
 
 api_key = os.environ.get(
     "GEMINI_API_KEY"
@@ -224,87 +286,129 @@ api_key = os.environ.get(
 
 
 if not api_key:
-    print("Missing GEMINI_API_KEY")
+
+    print(
+        "Missing GEMINI_API_KEY"
+    )
+
     sys.exit(1)
 
 
 
 url = (
+
     "https://generativelanguage.googleapis.com/"
+
     "v1beta/models/"
+
     "gemini-3.1-flash-lite:generateContent"
+
     f"?key={api_key}"
+
 )
+
+
+
+payload = {
+
+    "contents": [
+
+        {
+
+            "parts": [
+
+                {
+
+                    "text": prompt
+
+                }
+
+            ]
+
+        }
+
+    ]
+
+}
 
 
 
 def call_gemini():
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
 
+    for attempt in range(
+        MAX_RETRY
+    ):
 
-    for retry in range(MAX_RETRY):
 
         try:
 
-            r = requests.post(
+
+            response = requests.post(
+
                 url,
+
                 json=payload,
+
                 timeout=60
+
             )
 
 
-            if r.status_code == 200:
-                return r
+            if response.status_code == 200:
+
+                return response
 
 
-            if r.status_code in (
+
+            if response.status_code in (
+
                 429,
                 500,
                 503
+
             ):
 
-                sleep = 2 ** retry
+
+                wait = 2 ** attempt
+
 
                 print(
-                    f"Gemini retry after {sleep}s"
+                    f"Gemini retry after {wait}s"
                 )
 
+
                 time.sleep(
-                    sleep
+                    wait
                 )
 
                 continue
 
 
-            return r
+
+            return response
+
 
 
         except requests.exceptions.Timeout:
 
-            sleep = 2 ** retry
+
+            wait = 2 ** attempt
+
 
             print(
-                f"Timeout retry after {sleep}s"
+                f"Gemini timeout retry after {wait}s"
             )
+
 
             time.sleep(
-                sleep
+                wait
             )
 
 
-    raise Exception(
-        "Gemini API failed"
+
+    raise RuntimeError(
+        "Gemini API failed after retry"
     )
 
 
@@ -315,37 +419,52 @@ response = call_gemini()
 
 if response.status_code != 200:
 
+
+    print(
+        "Gemini API error:"
+    )
+
+
     print(
         response.text
     )
+
 
     sys.exit(1)
 
 
 
 # ======================================
-# Parse result
+# Parse Gemini Result
 # ======================================
-
-data = response.json()
 
 
 try:
 
-    text = (
+
+    data = response.json()
+
+
+    result_text = (
+
         data["candidates"][0]
+
         ["content"]
+
         ["parts"][0]
+
         ["text"]
+
     )
 
 
     result = json.loads(
-        text
+        result_text
     )
 
 
 except Exception:
+
 
     print(
         "Invalid Gemini response"
@@ -356,14 +475,101 @@ except Exception:
 
 
 # ======================================
-# Validate
+# JSON Validation
 # ======================================
 
-def placeholders(text):
+
+def validate_result(
+    result
+):
+
+
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        return False
+
+
+
+    if (
+        "has_issue" not in result
+        or "issues" not in result
+    ):
+
+        return False
+
+
+
+    for issue in result["issues"]:
+
+
+        fields = [
+
+            "original",
+
+            "problem",
+
+            "suggestion",
+
+            "severity"
+
+        ]
+
+
+        for field in fields:
+
+
+            if field not in issue:
+
+                return False
+
+
+
+        if issue["severity"].lower() not in (
+
+            "high",
+            "medium",
+            "low"
+
+        ):
+
+            return False
+
+
+
+    return True
+
+
+
+if not validate_result(
+    result
+):
+
+    print(
+        "Invalid JSON format"
+    )
+
+    sys.exit(1)
+
+
+
+# ======================================
+# Placeholder Validation
+# ======================================
+
+
+def get_placeholders(
+    text
+):
 
     return re.findall(
+
         r"\{[^}]+\}|%\w|\$\{[^}]+\}",
+
         text
+
     )
 
 
@@ -373,15 +579,30 @@ for issue in result.get(
     []
 ):
 
-    if placeholders(
-        issue.get("original", "")
-    ) != placeholders(
-        issue.get("suggestion", "")
+
+    original = issue.get(
+        "original",
+        ""
+    )
+
+
+    suggestion = issue.get(
+        "suggestion",
+        ""
+    )
+
+
+    if (
+        get_placeholders(original)
+        !=
+        get_placeholders(suggestion)
     ):
+
 
         print(
             "Placeholder changed:"
         )
+
 
         print(
             json.dumps(
@@ -391,68 +612,66 @@ for issue in result.get(
             )
         )
 
+
         sys.exit(1)
 
 
 
 # ======================================
-# Severity policy
+# Severity Policy
 # ======================================
+
 
 failed = False
 
 
-for issue in result.get(
-    "issues",
-    []
+if result.get(
+    "has_issue",
+    False
 ):
 
-    issue_type = issue.get(
-        "type",
-        ""
-    ).lower()
+
+    print(
+        "===== Localization Issues ====="
+    )
 
 
-    severity = issue.get(
-        "severity",
-        ""
-    ).lower()
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False
+        )
+    )
 
 
-    if (
-        "spelling" in issue_type
-        or "grammar" in issue_type
+    for issue in result.get(
+        "issues",
+        []
     ):
 
-        failed = True
+
+        if issue.get(
+            "severity",
+            ""
+        ).lower() == "high":
+
+            failed = True
 
 
-    if severity == "high":
 
-        failed = True
-
-
-
-print(
-    "===== Localization Issues ====="
-)
-
-
-print(
-    json.dumps(
-        result,
-        indent=2,
-        ensure_ascii=False
-    )
-)
-
+# ======================================
+# Final Result
+# ======================================
 
 
 if failed:
 
+
     print(
         "Localization Quality Gate Failed"
     )
+
 
     sys.exit(1)
 
@@ -461,5 +680,6 @@ if failed:
 print(
     "Localization check passed"
 )
+
 
 sys.exit(0)

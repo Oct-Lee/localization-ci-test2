@@ -5,7 +5,7 @@ logger = logging.getLogger(__name__)
 
 
 CAMERA_NOT_FOUND_ERROR = (
-    "camera[{camera_id}] not is Founded. "
+    "camera[{camera_id}] not Founded. "
     "Please check whether the "
     "'camera_id' parameter of the configrations file is correct"
 )
@@ -27,7 +27,7 @@ MESSAGE = (
 
 
 CHINESE_ERROR = (
-    "无法打开摄像头设备，请检查摄像头是不是正常"
+    "打开无法摄像头设备，请检查摄像头是不是正常"
 )
 
 
