@@ -201,7 +201,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 "path": entry["path"],
                 "added": entry["added"],
                 "deleted": entry["deleted"],
-                "added_lines": [item["line"] for item in entry["added_lines"]],
             }
         )
 
@@ -225,11 +224,8 @@ def print_files_report(files: list[dict[str, Any]]) -> None:
         return
     print("Diff scope:", file=sys.stderr)
     for item in files:
-        lines = item.get("added_lines") or []
-        lines_str = ",".join(str(n) for n in lines) if lines else "-"
         print(
-            f"  {item['path']}  +{item['added']} -{item['deleted']}  "
-            f"added_lines=[{lines_str}]",
+            f"  {item['path']}  +{item['added']} -{item['deleted']}",
             file=sys.stderr,
         )
 
@@ -389,14 +385,11 @@ def format_step_summary(
     if not files:
         lines.append("_No files in scope._")
     else:
-        lines.append("| File | Added | Deleted | Added lines |")
-        lines.append("| --- | ---: | ---: | --- |")
+        lines.append("| File | Added | Deleted |")
+        lines.append("| --- | ---: | ---: |")
         for item in files:
-            added_lines = item.get("added_lines") or []
-            lines_str = ", ".join(str(n) for n in added_lines) if added_lines else "-"
             lines.append(
-                f"| {_md_cell(item['path'])} | {item['added']} | "
-                f"{item['deleted']} | {_md_cell(lines_str)} |"
+                f"| {_md_cell(item['path'])} | {item['added']} | {item['deleted']} |"
             )
 
     lines.extend(["", "### Issues", ""])
