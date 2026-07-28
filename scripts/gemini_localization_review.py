@@ -335,11 +335,25 @@ def extract_usage(api_payload: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "N/A"
 
 
-def fail(message: str, *, summary: str | None = None) -> int:
+def empty_result() -> dict[str, Any]:
+    return {"has_issue": False, "issues": []}
+
+
+def print_result_json(result: dict[str, Any]) -> None:
+    """Stdout contract: validated JSON matching the gate schema."""
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def fail(
+    message: str,
+    *,
+    summary: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> int:
     print(message, file=sys.stderr)
     if summary:
         append_step_summary(summary)
-        print(summary)
+    print_result_json(result if result is not None else empty_result())
     return 1
 
 
@@ -356,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"Failed to read diff file: {exc}")
 
     if not diff_text.strip():
-        print("No changes detected")
+        print("No changes detected", file=sys.stderr)
         summary = format_step_summary(
             status="PASSED",
             issues=[],
@@ -365,12 +379,12 @@ def main(argv: list[str] | None = None) -> int:
             extra_note="No changes detected",
         )
         append_step_summary(summary)
-        print(summary)
+        print_result_json(empty_result())
         return 0
 
     review_text = parse_diff(diff_text)
     if not review_text.strip():
-        print("No user-facing changes")
+        print("No user-facing changes", file=sys.stderr)
         summary = format_step_summary(
             status="PASSED",
             issues=[],
@@ -379,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             extra_note="No user-facing changes",
         )
         append_step_summary(summary)
-        print(summary)
+        print_result_json(empty_result())
         return 0
 
     truncated = False
@@ -430,13 +444,9 @@ def main(argv: list[str] | None = None) -> int:
         usage=usage,
     )
     append_step_summary(summary)
-    print(summary)
-
-    for issue in issues:
-        print(
-            f"[{issue['severity']}] original={issue['original']!r} "
-            f"problem={issue['problem']!r} suggestion={issue['suggestion']!r}"
-        )
+    # Human-readable Markdown stays in GITHUB_STEP_SUMMARY only.
+    # Stdout is always the validated JSON schema result.
+    print_result_json(result)
 
     if blocked:
         print("Blocking HIGH severity issues found", file=sys.stderr)
