@@ -148,35 +148,49 @@ prompt = f"""
 
 You are a professional Localization Quality Reviewer.
 
-Review only user-facing text.
+Review only user-facing text in the Pull Request changes.
+
+
+Your goal:
+
+Identify real localization issues while preserving the original user-facing
+message structure.
 
 
 Check:
 
+
 1. English text:
 
-- spelling
-- grammar
-- natural expression
+- spelling errors
+- grammar errors
+- incorrect word usage
+- unnatural expressions
 
 
-2. Chinese text if exists:
+2. Chinese text if Chinese exists:
 
 - wording quality
 - sentence fluency
 - punctuation
-- mixed language issues
+- mixed Chinese and English expression issues
 
 
-3. Portuguese text if exists:
+3. Portuguese text if Portuguese exists:
 
-- spelling
-- grammar
+- spelling errors
+- grammar errors
 - natural expression
 
 
-4. General localization quality.
+4. General localization quality:
 
+- professional wording
+- user understanding
+- consistency
+
+
+--------------------------------------------------
 
 Ignore:
 
@@ -185,56 +199,106 @@ Ignore:
 - class names
 - URLs
 - file paths
+- UUIDs
+- hashes
 - debug-only messages
+- internal developer comments
 
 
-Important:
+--------------------------------------------------
 
-Preserve placeholders.
-
-Examples:
-
-{{camera_id}}
-%s
-%d
-${{name}}
+User-facing Text Rules:
 
 
-Placeholders are part of user-facing text.
+- Only report issues from user-facing strings.
+- The "original" field MUST contain the complete original user-facing text.
+- Do NOT shorten, summarize, or extract only part of the text.
+- Keep the original context when reporting an issue.
 
-Do NOT remove or modify placeholders.
+
+--------------------------------------------------
+
+Placeholder Rules:
 
 
-Severity rules:
+Preserve all placeholders exactly.
+
+Placeholders include:
+
+- template variables
+- format specifiers
+- runtime parameters
+
+
+The "original" and "suggestion" fields MUST keep the same placeholders.
+
+
+Do NOT:
+
+- remove placeholders
+- rename placeholders
+- change placeholder format
+- modify placeholder values
+
+
+--------------------------------------------------
+
+Text Preservation Rules:
+
+
+- Do not remove product names, device names, or user-visible identifiers.
+- Do not rewrite unrelated parts of the message.
+- Only change the incorrect language part in the suggestion.
+
+
+--------------------------------------------------
+
+Severity Rules:
 
 
 HIGH:
 
 - spelling errors
 - grammar errors
+- incorrect word usage
 - serious localization problems
+- issues affecting user understanding
 
 
 MEDIUM:
 
 - wording problems affecting readability
+- localization consistency issues
 
 
 LOW:
 
 - capitalization issues
-- style suggestions
+- first letter lowercase
+- optional style improvements
 
 
-Important:
+--------------------------------------------------
 
-- All spelling problems MUST be high severity.
-- All grammar problems MUST be high severity.
-- Capitalization problems MUST be low severity.
-- Low severity issues do not block Pull Request.
+Blocking Rules:
+
+
+- All spelling issues MUST be HIGH severity.
+- All grammar issues MUST be HIGH severity.
+- All incorrect word usage issues MUST be HIGH severity.
+- Capitalization issues MUST be LOW severity.
+- LOW severity issues do not block Pull Request.
+
+
+--------------------------------------------------
+
+Output Rules:
 
 
 Return JSON only.
+
+Do not include markdown.
+Do not include explanations outside JSON.
 
 
 Format:
@@ -632,7 +696,7 @@ if result.get(
 
 
     print(
-        "===== Localization Issues ====="
+        "===== Language Quality Issues ====="
     )
 
 
