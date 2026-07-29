@@ -35,19 +35,6 @@ FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
     re.DOTALL | re.IGNORECASE,
 )
-# Translation / i18n object keys and similar identifiers (NOT user-facing text).
-IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
-KEY_ONLY_RE = re.compile(r"^[A-Z][A-Z0-9_]*\s*:?\s*,?\s*$")
-ASSIGNMENT_LINE_RE = re.compile(
-    r"""^\s*([A-Z][A-Z0-9_]*)\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""",
-    re.DOTALL,
-)
-NON_USERFACING_PROBLEM_RE = re.compile(
-    r"missing comma|extra comma|syntax|object key|property name|variable name|"
-    r"constant name|identifier|key name|missing colon|json structure|"
-    r"javascript syntax|python syntax",
-    re.IGNORECASE,
-)
 
 SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
@@ -59,40 +46,18 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer.
 
-Review ONLY user-facing string VALUES in the PR changes below
-(English / Simplified Chinese / Portuguese).
+Review ONLY user-facing texts in the PR changes below.
+Supported languages in string content: English, Simplified Chinese, Portuguese.
 
-In translation / i18n files like:
-  KEY_NAME: 'Some user visible text',
-or:
-  KEY_NAME = "Some user visible text"
-you MUST review only the quoted string value ("Some user visible text").
-You MUST IGNORE:
-- Object keys / constant names / identifiers (e.g. COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE,
-  FLEX_LIGNT_CONTROL_TITLE, FILE_CAMERA_NOT_SELECT) — even if the key has a typo
-- Syntax / punctuation of code structure (commas, colons, braces, quotes around keys)
-- Variable names, function names, class names, URLs, paths, UUIDs, hashes
-- Debug-only messages and internal comments
+Ignore: variable names, function names, class names, URLs, file paths, UUIDs,
+hashes, debug-only messages, and internal comments.
 
 For each issue:
-- "original" MUST be ONLY the user-facing string value (inside quotes), NOT the key
-  and NOT the whole "KEY: 'value'" line
-- "suggestion" MUST be ONLY the corrected user-facing string value
-- "file" and "line" come from the "# file:" / "# line:" markers when available
+- "original" must be the complete user-facing original text
+- "suggestion" must only correct the erroneous parts
+- "file" and "line" must come from the "# file:" / "# line:" markers of the
+  matching added line when available
 - Placeholders matching {{...}}, %s / %d / %w style, and ${{...}} MUST remain identical
-
-Good example:
-  Input line: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
-  Issue:
-    original: "File Camera not select"
-    suggestion: "File Camera not selected"
-    problem: "Grammar: use 'selected'"
-    severity: "high"
-
-Bad examples (DO NOT emit):
-  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE for "missing comma"
-  - Changing FLEX_LIGNT_CONTROL_TITLE → FLEX_LIGHT_CONTROL_TITLE (key spelling)
-  - original/suggestion containing "KEY: 'value'" instead of just the value
 
 Casing / word-form rules (critical):
 - Fix the word itself; do NOT introduce incorrect capitalization.
@@ -107,9 +72,9 @@ Casing / word-form rules (critical):
 Severity rules (severity values MUST be lowercase):
 - HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
   seriously hurt understanding. ALL spelling / grammar / incorrect word usage
-  in user-facing VALUES MUST be "high".
-- MEDIUM: Wording / Readability / consistency improvements of VALUES
-- LOW: Capitalization and optional style of VALUES. Capitalization MUST be "low".
+  MUST be "high".
+- MEDIUM: Wording / Readability / consistency improvements
+- LOW: Capitalization and optional style. Capitalization MUST be "low".
 
 Blocking rule: only "high" severity blocks merge.
 
@@ -135,87 +100,6 @@ PR changes to review:
 {review_text}
 """
 
-
-def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tuple[str, bool]:
-    """Truncate on chunk boundaries when possible to avoid mid-entry cuts."""
-    if len(review_text) <= limit:
-        return review_text, False
-    truncated = review_text[:limit]
-    cut = truncated.rfind("\n\n")
-    if cut > limit // 2:
-        truncated = truncated[:cut]
-    return truncated, True
-
-
-def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
-    """Prefer quoted string values; drop issues that rename i18n keys."""
-    out = dict(issue)
-    original = out.get("original", "").strip()
-    suggestion = out.get("suggestion", "").strip()
-    o_m = ASSIGNMENT_LINE_RE.match(original)
-    s_m = ASSIGNMENT_LINE_RE.match(suggestion)
-
-    if o_m and s_m:
-        if o_m.group(1) != s_m.group(1):
-            out["_invalid"] = "identifier_rename"
-            return out
-        out["original"] = o_m.group(3)
-        out["suggestion"] = s_m.group(3)
-        return out
-
-    if o_m and not s_m:
-        out["original"] = o_m.group(3)
-        # suggestion already looks like a bare value
-        return out
-
-    return out
-
-
-def is_non_userfacing_issue(issue: dict[str, Any]) -> bool:
-    """True if the model wrongly targeted keys/syntax instead of string values."""
-    if issue.get("_invalid"):
-        return True
-
-    original = issue.get("original", "").strip()
-    suggestion = issue.get("suggestion", "").strip()
-    problem = issue.get("problem", "")
-
-    if KEY_ONLY_RE.match(original):
-        return True
-    if NON_USERFACING_PROBLEM_RE.search(problem):
-        return True
-
-    # KEY: 'value' form where suggestion renames the KEY (identifier typo).
-    orig_ids = set(IDENTIFIER_RE.findall(original))
-    sugg_ids = set(IDENTIFIER_RE.findall(suggestion))
-    if orig_ids != sugg_ids:
-        if re.search(r"[A-Z][A-Z0-9_]{2,}\s*:", original) or re.search(
-            r"[A-Z][A-Z0-9_]{2,}\s*:", suggestion
-        ):
-            return True
-        if not re.search(r"['\"]", original) and orig_ids:
-            return True
-
-    if re.match(r"^[A-Z][A-Z0-9_]*\s*:", original) and original.rstrip().endswith(":"):
-        return True
-
-    return False
-
-
-def filter_userfacing_issues(
-    issues: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Keep only issues about user-facing values; return (kept, dropped)."""
-    kept: list[dict[str, Any]] = []
-    dropped: list[dict[str, Any]] = []
-    for issue in issues:
-        normalized = normalize_issue_to_string_value(issue)
-        if is_non_userfacing_issue(normalized):
-            dropped.append(issue)
-            continue
-        normalized.pop("_invalid", None)
-        kept.append(normalized)
-    return kept, dropped
 
 def _new_file_entry(path: str) -> dict[str, Any]:
     return {
@@ -637,16 +521,13 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"Failed to read diff file: {exc}")
 
     if not diff_text.strip():
-        print(
-            "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API",
-            file=sys.stderr,
-        )
+        print("No changes detected", file=sys.stderr)
         summary = format_step_summary(
             status="PASSED",
             issues=[],
             duration_sec=None,
             truncated=False,
-            extra_note="Out of path scope / empty diff — Gemini API not called",
+            extra_note="No changes detected",
             files=[],
         )
         append_step_summary(summary)
@@ -660,16 +541,13 @@ def main(argv: list[str] | None = None) -> int:
     print_files_report(files)
 
     if not review_text.strip():
-        print(
-            "No added lines to review under scoped diff — skip Gemini API",
-            file=sys.stderr,
-        )
+        print("No user-facing changes", file=sys.stderr)
         summary = format_step_summary(
             status="PASSED",
             issues=[],
             duration_sec=None,
             truncated=False,
-            extra_note="No added lines — Gemini API not called",
+            extra_note="No user-facing changes",
             files=files,
         )
         append_step_summary(summary)
@@ -678,10 +556,10 @@ def main(argv: list[str] | None = None) -> int:
 
     truncated = False
     if len(review_text) > MAX_REVIEW_CHARS:
-        review_text, truncated = truncate_review_text(review_text)
+        review_text = review_text[:MAX_REVIEW_CHARS]
+        truncated = True
         print(
-            f"Review text truncated to {len(review_text)} characters "
-            f"(limit {MAX_REVIEW_CHARS})",
+            f"Review text truncated to {MAX_REVIEW_CHARS} characters",
             file=sys.stderr,
         )
 
@@ -708,15 +586,6 @@ def main(argv: list[str] | None = None) -> int:
         result = parse_model_json(raw_text)
         check_placeholders(result["issues"])
         result["issues"] = attach_locations(result["issues"], added_details)
-        kept, dropped = filter_userfacing_issues(result["issues"])
-        if dropped:
-            print(
-                f"Filtered {len(dropped)} non-user-facing issue(s) "
-                f"(keys/syntax/identifiers ignored)",
-                file=sys.stderr,
-            )
-        result["issues"] = kept
-        result["has_issue"] = bool(kept)
         result["files"] = files
     except Exception as exc:  # noqa: BLE001 — fail-closed for infrastructure errors
         summary = format_step_summary(
