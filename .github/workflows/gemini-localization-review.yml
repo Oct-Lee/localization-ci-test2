@@ -35,6 +35,9 @@ jobs:
         :(glob)**/translations*/english.py
         :(glob)**/translations*/chinese.py
         :(glob)**/translations*/portuguese.py
+        :(glob)**/translations*/english.js
+        :(glob)**/translations*/chinese.js
+        :(glob)**/translations*/portuguese.js
         :(glob)apps/x/**/resources/i18n/**
         :(glob)apps/x/central-web/**/assets/i18n.csv
         :(glob)apps/x/edge-web/**/assets/i18n.csv
