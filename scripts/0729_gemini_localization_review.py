@@ -35,37 +35,17 @@ FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
     re.DOTALL | re.IGNORECASE,
 )
-# Monorepo key styles: SCREAMING_SNAKE, snake_case, camelCase.
-PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
-# SCREAMING_SNAKE / constant-style identifiers (for LOW severity key typos).
+# Translation / i18n object keys and similar identifiers (NOT user-facing text).
 IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
-KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
-KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
-PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
-STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])(.*)\1\s*,?\s*$""")
+KEY_ONLY_RE = re.compile(r"^[A-Z][A-Z0-9_]*\s*:?\s*,?\s*$")
 ASSIGNMENT_LINE_RE = re.compile(
-    rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""",
+    r"""^\s*([A-Z][A-Z0-9_]*)\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""",
     re.DOTALL,
-)
-JSON_KV_RE = re.compile(
-    r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$"""
-)
-# Skip structural / import noise lines — not user-facing content.
-SKIP_LINE_RE = re.compile(
-    r"""(?x)
-    ^\s*(?:
-        import\b|from\b|export\s+default\b|export\s+const\b|
-        const\s+\w+\s*=\s*\{|
-        /\*|^\s*\*|^\s*//|
-        \}|\{|,|
-        \#
-    )
-    """
 )
 NON_USERFACING_PROBLEM_RE = re.compile(
     r"missing comma|extra comma|syntax|object key|property name|variable name|"
     r"constant name|identifier|key name|missing colon|json structure|"
-    r"javascript syntax|python syntax|typescript syntax",
+    r"javascript syntax|python syntax",
     re.IGNORECASE,
 )
 
@@ -77,70 +57,42 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def build_prompt(review_text: str) -> str:
-    return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
+    return f"""You are a Localization Quality Reviewer.
 
 Review ONLY user-facing string VALUES in the PR changes below
 (English / Simplified Chinese / Portuguese).
 
-Monorepo formats you will see:
-- JS/TS object:  auth_login: 'LOG IN'   |  title: 'ComX Config'
-- JS/TS multiline (VALID):  loading_license_check:\\n  'long text'
-- Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
-- JSON:  "confirm": "Confirm"
-- CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
-When a line is annotated with "user_facing: ...", review that text first.
+In translation / i18n files like:
+  KEY_NAME: 'Some user visible text',
+or:
+  KEY_NAME = "Some user visible text"
+you MUST review only the quoted string value ("Some user visible text").
+You MUST IGNORE:
+- Object keys / constant names / identifiers (e.g. COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE,
+  FLEX_LIGNT_CONTROL_TITLE, FILE_CAMERA_NOT_SELECT) — even if the key has a typo
+- Syntax / punctuation of code structure (commas, colons, braces, quotes around keys)
+- Variable names, function names, class names, URLs, paths, UUIDs, hashes
+- Debug-only messages and internal comments
 
-Rules:
-1) Primary focus: quoted string VALUES (user-facing text).
-   For value issues, "original" / "suggestion" MUST be ONLY the string value,
-   NOT the whole "KEY: 'value'" / 'KEY = "value"' line.
-2) Constant / object-key / identifier names (e.g. FLEX_LIGNT_CONTROL_TITLE,
-   cencel, dictionries): MAY be reported when misspelled, but severity MUST be
-   "low" (never high/medium). These do NOT block merge.
-3) MUST IGNORE code syntax / structure problems:
-   missing/extra commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
-4) Multiline key/value split is VALID. Never report "missing comma" / "incomplete
-   statement" just because the value is on the next line after "KEY_NAME:".
-   Review the following quoted value instead.
-5) Placeholders {{...}}, %s / %d / %w, ${{...}}, and Python {{}} / str.format
-   fields MUST remain identical in suggestions.
+For each issue:
+- "original" MUST be ONLY the user-facing string value (inside quotes), NOT the key
+  and NOT the whole "KEY: 'value'" line
+- "suggestion" MUST be ONLY the corrected user-facing string value
+- "file" and "line" come from the "# file:" / "# line:" markers when available
+- Placeholders matching {{...}}, %s / %d / %w style, and ${{...}} MUST remain identical
 
-Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
-messages, internal comments, vendor/framework glue.
-
-Good examples:
-  Input: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
-  → original: "File Camera not select"
+Good example:
+  Input line: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
+  Issue:
+    original: "File Camera not select"
     suggestion: "File Camera not selected"
+    problem: "Grammar: use 'selected'"
     severity: "high"
-
-  Input (multiline — valid):
-    COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE:
-      'Please save the changes to the Sequence first',
-  → review only: "Please save the changes to the Sequence first"
-  → DO NOT flag the key line as missing comma / incomplete syntax
-
-  Input: ERROR_CANNOT_FIND_CAMERA = "Cannot find camera {{}}. Pleace check..."
-  → original: "Cannot find camera {{}}. Pleace check..."
-    suggestion: "Cannot find camera {{}}. Please check..."
-    severity: "high"
-
-  Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
-  → original: "FLEX_LIGNT_CONTROL_TITLE"
-    suggestion: "FLEX_LIGHT_CONTROL_TITLE"
-    problem: "Identifier spelling: LIGNT → LIGHT"
-    severity: "low"
-
-  Input: cencel: 'Cencel',
-  → may emit TWO issues:
-      value: original "Cencel" → "Cancel" (high)
-      key: original "cencel" → "cancel" (low)
 
 Bad examples (DO NOT emit):
-  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE: as "missing comma" because
-    the string value is on the next line
-  - Marking identifier/key typos as high/medium
-  - Putting "KEY: 'value'" into original for a value-only grammar fix
+  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE for "missing comma"
+  - Changing FLEX_LIGNT_CONTROL_TITLE → FLEX_LIGHT_CONTROL_TITLE (key spelling)
+  - original/suggestion containing "KEY: 'value'" instead of just the value
 
 Casing / word-form rules (critical):
 - Fix the word itself; do NOT introduce incorrect capitalization.
@@ -154,12 +106,10 @@ Casing / word-form rules (critical):
 
 Severity rules (severity values MUST be lowercase):
 - HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
-  seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
-  incorrect word usage in VALUES MUST be "high".
+  seriously hurt understanding. ALL spelling / grammar / incorrect word usage
+  in user-facing VALUES MUST be "high".
 - MEDIUM: Wording / Readability / consistency improvements of VALUES
-- LOW: Capitalization / optional style of VALUES, AND any constant-name /
-  identifier / object-key spelling issues. Capitalization and identifier
-  issues MUST be "low".
+- LOW: Capitalization and optional style of VALUES. Capitalization MUST be "low".
 
 Blocking rule: only "high" severity blocks merge.
 
@@ -186,58 +136,6 @@ PR changes to review:
 """
 
 
-def should_skip_review_line(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return True
-    if SKIP_LINE_RE.match(stripped):
-        return True
-    if stripped in {
-        "{",
-        "}",
-        "},",
-        "[",
-        "],",
-        "];",
-        "};",
-        ")",
-        "),",
-        "(",
-    }:
-        return True
-    return False
-
-
-def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
-    """Extract candidate user-facing strings from a single added line."""
-    stripped = text.strip()
-    if not stripped or should_skip_review_line(stripped):
-        return []
-
-    json_m = JSON_KV_RE.match(stripped)
-    if json_m:
-        return [json_m.group(2)]
-
-    assign_m = ASSIGNMENT_LINE_RE.match(stripped)
-    if assign_m:
-        return [assign_m.group(3)]
-
-    str_m = STRING_VALUE_LINE_RE.match(stripped)
-    if str_m:
-        return [str_m.group(2)]
-
-    lower_path = path.lower()
-    if lower_path.endswith(".csv") or stripped.count(",") >= 2:
-        if stripped.lower().startswith("key,"):
-            return []
-        parts = [p.strip() for p in stripped.split(",")]
-        if len(parts) >= 2 and parts[0]:
-            return [p for p in parts[1:] if p]
-
-    return []
-
-
-
 def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tuple[str, bool]:
     """Truncate on chunk boundaries when possible to avoid mid-entry cuts."""
     if len(review_text) <= limit:
@@ -250,7 +148,7 @@ def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tup
 
 
 def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
-    """Normalize KEY: 'value' lines; mark identifier renames for LOW severity."""
+    """Prefer quoted string values; drop issues that rename i18n keys."""
     out = dict(issue)
     original = out.get("original", "").strip()
     suggestion = out.get("suggestion", "").strip()
@@ -259,115 +157,47 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
 
     if o_m and s_m:
         if o_m.group(1) != s_m.group(1):
-            # Constant/key rename — keep as identifier issue (forced LOW later).
-            out["original"] = o_m.group(1)
-            out["suggestion"] = s_m.group(1)
-            out["_kind"] = "identifier"
+            out["_invalid"] = "identifier_rename"
             return out
         out["original"] = o_m.group(3)
         out["suggestion"] = s_m.group(3)
-        out["_kind"] = "value"
         return out
 
     if o_m and not s_m:
         out["original"] = o_m.group(3)
-        out["_kind"] = "value"
+        # suggestion already looks like a bare value
         return out
 
     return out
 
 
-def looks_like_code_key(text: str) -> bool:
-    """Heuristic: i18n/object keys vs Title-Case user-facing words."""
-    s = text.strip().rstrip(",").rstrip(":")
-    if not s or not re.match(rf"^{PROP_KEY}$", s):
-        return False
-    if "_" in s:
-        return True  # snake_case / SCREAMING_SNAKE
-    if s.isupper() and len(s) >= 3:
-        return True  # ACRONYM constants
-    if re.match(r"^[a-z]+[A-Z]", s):
-        return True  # camelCase
-    return False
-
-
-def is_identifier_issue(issue: dict[str, Any]) -> bool:
-    """True when the finding targets a constant/key/identifier name."""
-    if issue.get("_kind") == "identifier":
+def is_non_userfacing_issue(issue: dict[str, Any]) -> bool:
+    """True if the model wrongly targeted keys/syntax instead of string values."""
+    if issue.get("_invalid"):
         return True
 
     original = issue.get("original", "").strip()
     suggestion = issue.get("suggestion", "").strip()
-    problem = issue.get("problem", "").lower()
+    problem = issue.get("problem", "")
 
-    if any(
-        token in problem
-        for token in (
-            "identifier",
-            "constant name",
-            "key name",
-            "object key",
-            "property name",
-            "variable name",
-        )
-    ):
-        # Exclude pure syntax complaints handled elsewhere.
-        if "comma" in problem or "syntax" in problem or "colon" in problem:
-            return False
+    if KEY_ONLY_RE.match(original):
+        return True
+    if NON_USERFACING_PROBLEM_RE.search(problem):
         return True
 
-    if looks_like_code_key(original) and looks_like_code_key(suggestion):
-        o_key = original.rstrip().rstrip(",").rstrip(":")
-        s_key = suggestion.rstrip().rstrip(",").rstrip(":")
-        if o_key != s_key:
-            return True
-
+    # KEY: 'value' form where suggestion renames the KEY (identifier typo).
     orig_ids = set(IDENTIFIER_RE.findall(original))
     sugg_ids = set(IDENTIFIER_RE.findall(suggestion))
     if orig_ids != sugg_ids:
-        if re.search(rf"{PROP_KEY}\s*:", original) or re.search(
-            rf"{PROP_KEY}\s*:", suggestion
+        if re.search(r"[A-Z][A-Z0-9_]{2,}\s*:", original) or re.search(
+            r"[A-Z][A-Z0-9_]{2,}\s*:", suggestion
         ):
             return True
-        if (
-            not re.search(r"['\"]", original)
-            and looks_like_code_key(original)
-            and looks_like_code_key(suggestion)
-        ):
+        if not re.search(r"['\"]", original) and orig_ids:
             return True
 
-    return False
-
-
-def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
-    """Drop code-structure complaints that are not localization quality."""
-    original = issue.get("original", "").strip()
-    problem = issue.get("problem", "")
-
-    if NON_USERFACING_PROBLEM_RE.search(problem):
-        # Identifier spelling mentioned with syntax words → still syntax FP if
-        # about commas/structure; identifier-only handled separately.
-        if re.search(r"comma|syntax|colon|brace|quote", problem, re.IGNORECASE):
-            return True
-
-    # Key-only original with no real rename suggestion (e.g. add comma).
-    if looks_like_code_key(original) or KEY_ONLY_RE.match(original):
-        suggestion = issue.get("suggestion", "").strip()
-        if looks_like_code_key(suggestion) or KEY_ONLY_RE.match(suggestion):
-            o_key = original.rstrip().rstrip(",").rstrip(":")
-            s_key = suggestion.rstrip().rstrip(",").rstrip(":")
-            if o_key == s_key:
-                return True
-        elif not suggestion:
-            return True
-
-    if re.match(rf"^{PROP_KEY}\s*:$", original):
-        suggestion = issue.get("suggestion", "").strip()
-        o_key = original.rstrip(":")
-        s_m = re.match(rf"^({PROP_KEY})\s*:?\s*,?\s*$", suggestion)
-        # Trailing-colon key with no rename → multiline/format FP, not a finding.
-        if not s_m or s_m.group(1) == o_key:
-            return True
+    if re.match(r"^[A-Z][A-Z0-9_]*\s*:", original) and original.rstrip().endswith(":"):
+        return True
 
     return False
 
@@ -375,27 +205,15 @@ def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
 def filter_userfacing_issues(
     issues: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Drop syntax FPs; keep value issues; keep identifier issues as LOW."""
+    """Keep only issues about user-facing values; return (kept, dropped)."""
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     for issue in issues:
         normalized = normalize_issue_to_string_value(issue)
-
-        if is_syntax_false_positive(normalized):
+        if is_non_userfacing_issue(normalized):
             dropped.append(issue)
             continue
-
-        if is_identifier_issue(normalized):
-            normalized["severity"] = SEVERITY_LOW
-            if not normalized.get("problem"):
-                normalized["problem"] = "Identifier / constant-name spelling"
-            elif "identifier" not in normalized["problem"].lower():
-                normalized["problem"] = (
-                    f"Identifier / constant-name: {normalized['problem']}"
-                )
-
         normalized.pop("_invalid", None)
-        normalized.pop("_kind", None)
         kept.append(normalized)
     return kept, dropped
 
@@ -406,30 +224,6 @@ def _new_file_entry(path: str) -> dict[str, Any]:
         "deleted": 0,
         "added_lines": [],  # list[{"line": int, "text": str}]
     }
-
-
-def _peek_multiline_string_value(
-    lines: list[str], start_idx: int
-) -> tuple[int, str] | None:
-    """If next added line is a quoted value for a multiline KEY:, return (idx, text)."""
-    for j in range(start_idx + 1, min(len(lines), start_idx + 6)):
-        candidate = lines[j]
-        if candidate.startswith("---") or candidate.startswith("+++"):
-            return None
-        if candidate.startswith("@@"):
-            return None
-        if candidate.startswith("-"):
-            continue
-        if candidate.startswith("+"):
-            value_text = candidate[1:]
-            if STRING_VALUE_LINE_RE.match(value_text):
-                return j, value_text
-            return None
-        if candidate.startswith(" "):
-            # Unchanged context between key and value — still allow.
-            continue
-        return None
-    return None
 
 
 def analyze_diff(diff_text: str) -> dict[str, Any]:
@@ -444,7 +238,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
     new_line_no: int | None = None
     review_chunks: list[str] = []
     seen: set[str] = set()
-    skip_indices: set[int] = set()
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
@@ -459,6 +252,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             new_line_no = None
             continue
         if line.startswith("+++ "):
+            # e.g. +++ /dev/null
             rest = line[4:]
             if rest.startswith("b/"):
                 current_file = rest[2:]
@@ -471,6 +265,10 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             new_line_no = int(hunk.group(3))
             continue
 
+        if not current_file:
+            # Still allow +++-less diffs; try --- a/ fallback later via +++ only
+            pass
+
         if line.startswith("+") and not line.startswith("+++"):
             entry = ensure_file(current_file or "(unknown)")
             line_no = new_line_no if new_line_no is not None else -1
@@ -480,49 +278,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             if new_line_no is not None:
                 new_line_no += 1
 
-            if idx in skip_indices:
-                continue
-
-            path_label = current_file or "(unknown)"
-
-            # JS/TS multiline KEY: + value, or Python KEY = ( + "value"
-            key_only = KEY_ONLY_LINE_RE.match(text)
-            py_open = PY_KEY_OPEN_RE.match(text)
-            merged_value = None
-            if key_only or py_open:
-                merged_value = _peek_multiline_string_value(lines, idx)
-
-            if (key_only or py_open) and merged_value:
-                value_idx, value_text = merged_value
-                skip_indices.add(value_idx)
-                value_line_no = line_no + 1 if line_no >= 0 else -1
-                key_name = (key_only or py_open).group(1)
-                string_m = STRING_VALUE_LINE_RE.match(value_text)
-                string_val = string_m.group(2) if string_m else value_text.strip()
-                opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                chunk = (
-                    f"# file: {path_label}\n"
-                    f"# line: {value_line_no}\n"
-                    f"# key: {key_name}\n"
-                    f"# note: multiline KEY + string value (valid formatting)\n"
-                    f"+  {opener}\n"
-                    f"+    {value_text.strip()}\n"
-                    f"user_facing: {string_val}"
-                )
-                dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                if dedupe_key not in seen:
-                    seen.add(dedupe_key)
-                    review_chunks.append(chunk)
-                continue
-
-            # Bare key / KEY = ( without visible value yet — wait for value line.
-            if key_only or py_open:
-                continue
-
-            if should_skip_review_line(text):
-                continue
-
-            hints = extract_user_facing_hints(text, path_label)
             start = max(0, idx - CONTEXT_LINES)
             end = min(len(lines), idx + CONTEXT_LINES + 1)
             window: list[str] = []
@@ -533,17 +288,16 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 if candidate.startswith("@@"):
                     continue
                 window.append(candidate)
-            if not window and not hints:
+            if not window:
                 continue
-            body = "\n".join(window) if window else f"+{text}"
-            if hints:
-                body = body + "\n" + "\n".join(f"user_facing: {h}" for h in hints)
-            dedupe_key = f"{path_label}:{line_no}:{body}"
+            chunk = "\n".join(window)
+            dedupe_key = f"{current_file}:{line_no}:{chunk}"
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
+            path_label = current_file or "(unknown)"
             header = f"# file: {path_label}\n# line: {line_no}"
-            review_chunks.append(f"{header}\n{body}")
+            review_chunks.append(f"{header}\n{chunk}")
             continue
 
         if line.startswith("-") and not line.startswith("---"):
@@ -551,6 +305,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             entry["deleted"] += 1
             continue
 
+        # context line (starts with space) advances new-side counter
         if line.startswith(" ") and new_line_no is not None:
             new_line_no += 1
 
@@ -956,18 +711,8 @@ def main(argv: list[str] | None = None) -> int:
         kept, dropped = filter_userfacing_issues(result["issues"])
         if dropped:
             print(
-                f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
-                file=sys.stderr,
-            )
-        id_low = sum(
-            1
-            for issue in kept
-            if issue["severity"] == SEVERITY_LOW
-            and "identifier" in issue.get("problem", "").lower()
-        )
-        if id_low:
-            print(
-                f"Downgraded {id_low} constant-name / identifier issue(s) to low",
+                f"Filtered {len(dropped)} non-user-facing issue(s) "
+                f"(keys/syntax/identifiers ignored)",
                 file=sys.stderr,
             )
         result["issues"] = kept
