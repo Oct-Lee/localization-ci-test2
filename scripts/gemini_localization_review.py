@@ -103,7 +103,9 @@ Rules:
    statement" just because the value is on the next line after "KEY_NAME:".
    Review the following quoted value instead.
 5) Placeholders {{...}}, %s / %d / %w, ${{...}}, and Python {{}} / str.format
-   fields MUST remain identical in suggestions.
+   fields MUST remain identical in suggestions. NEVER invent placeholders that
+   are absent from original (e.g. do not turn "个物料模拟失败:" into
+   "%d个物料模拟失败"). NEVER remove existing placeholders.
 
 Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
 messages, internal comments, vendor/framework glue.
@@ -694,16 +696,34 @@ def placeholders(text: str) -> set[str]:
     return set(PLACEHOLDER_RE.findall(text))
 
 
-def check_placeholders(issues: list[dict[str, str]]) -> None:
+def filter_placeholder_mismatches(
+    issues: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Drop issues where suggestion adds/removes/changes placeholders.
+
+    Bad model suggestions (e.g. inventing '%d') must not fail the whole gate.
+    """
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
     for issue in issues:
         original_ph = placeholders(issue["original"])
         suggestion_ph = placeholders(issue["suggestion"])
         if original_ph != suggestion_ph:
-            raise ValueError(
-                "Placeholder mismatch between original and suggestion: "
-                f"original={sorted(original_ph)} suggestion={sorted(suggestion_ph)} "
-                f"issue={issue}"
-            )
+            dropped.append(issue)
+            continue
+        kept.append(issue)
+    return kept, dropped
+
+
+# Backward-compatible name used by older tests / callers.
+def check_placeholders(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept, dropped = filter_placeholder_mismatches(issues)
+    if dropped:
+        raise ValueError(
+            "Placeholder mismatch between original and suggestion: "
+            f"dropped={len(dropped)} example={dropped[0]}"
+        )
+    return kept
 
 
 def count_by_severity(issues: list[dict[str, str]]) -> dict[str, int]:
@@ -951,7 +971,6 @@ def main(argv: list[str] | None = None) -> int:
         api_payload, duration = call_gemini(api_key, prompt)
         raw_text = extract_response_text(api_payload)
         result = parse_model_json(raw_text)
-        check_placeholders(result["issues"])
         result["issues"] = attach_locations(result["issues"], added_details)
         kept, dropped = filter_userfacing_issues(result["issues"])
         if dropped:
@@ -959,6 +978,19 @@ def main(argv: list[str] | None = None) -> int:
                 f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
                 file=sys.stderr,
             )
+        kept, ph_dropped = filter_placeholder_mismatches(kept)
+        if ph_dropped:
+            print(
+                f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
+                f"(suggestion must not add/remove placeholders like %d / {{id}})",
+                file=sys.stderr,
+            )
+            for bad in ph_dropped[:5]:
+                print(
+                    f"  drop: original={bad.get('original')!r} "
+                    f"suggestion={bad.get('suggestion')!r}",
+                    file=sys.stderr,
+                )
         id_low = sum(
             1
             for issue in kept
