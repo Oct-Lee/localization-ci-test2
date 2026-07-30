@@ -36,6 +36,14 @@ GEMINI_TPM_LIMIT = 250_000
 GEMINI_RPD_LIMIT = 500
 # Leave headroom vs hard 15 RPM (60/15=4s; use 4.1s).
 MIN_REQUEST_INTERVAL_SEC = 60.0 / GEMINI_RPM_LIMIT + 0.1
+# RPM/TPM: wait ~1 min (or API "retry in Xs") and retry in the same workflow.
+QUOTA_RETRY_DEFAULT_SEC = 60.0
+MAX_QUOTA_RETRIES = 40  # up to ~40 minutes of quota waits per request
+RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+DAILY_QUOTA_RE = re.compile(
+    r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
+    re.IGNORECASE,
+)
 CONTEXT_LINES = 3
 PLACEHOLDER_RE = re.compile(r"\{[^}]+\}|%\w|\$\{[^}]+\}")
 FENCE_RE = re.compile(
@@ -843,23 +851,49 @@ def append_step_summary(markdown: str) -> None:
             handle.write("\n")
 
 
+def is_daily_quota_error(body: str) -> bool:
+    """RPD / daily quota cannot be fixed by waiting ~1 minute."""
+    return bool(DAILY_QUOTA_RE.search(body or ""))
+
+
+def parse_retry_after_seconds(response: requests.Response) -> float:
+    """Prefer API 'retry in Xs', then Retry-After header, else 60s."""
+    header = response.headers.get("Retry-After") or response.headers.get("retry-after")
+    if header:
+        try:
+            return max(float(header), QUOTA_RETRY_DEFAULT_SEC)
+        except ValueError:
+            pass
+    match = RETRY_IN_RE.search(response.text or "")
+    if match:
+        try:
+            return max(float(match.group(1)), 1.0)
+        except ValueError:
+            pass
+    return QUOTA_RETRY_DEFAULT_SEC
+
+
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
+    """Call Gemini; on RPM/TPM 429 wait ~1 min and retry until success (same job)."""
     url = f"{GEMINI_ENDPOINT}?key={api_key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     last_error: Exception | None = None
     start = time.monotonic()
+    quota_retries = 0
+    transient_attempts = 0
 
-    for attempt in range(MAX_ATTEMPTS):
+    while True:
         try:
             response = requests.post(url, json=body, timeout=HTTP_TIMEOUT_SEC)
         except requests.Timeout as exc:
             last_error = exc
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(2**attempt)
-                continue
-            raise RuntimeError(
-                f"Gemini API timeout after {MAX_ATTEMPTS} attempts"
-            ) from exc
+            transient_attempts += 1
+            if transient_attempts >= MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Gemini API timeout after {MAX_ATTEMPTS} attempts"
+                ) from exc
+            time.sleep(2 ** (transient_attempts - 1))
+            continue
         except requests.RequestException as exc:
             raise RuntimeError(f"Gemini API request failed: {exc}") from exc
 
@@ -872,16 +906,43 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                     f"Gemini returned non-JSON body: {response.text[:500]}"
                 ) from exc
 
-        if response.status_code in RETRYABLE_STATUS and attempt < MAX_ATTEMPTS - 1:
-            time.sleep(2**attempt)
+        if response.status_code == 429:
+            text = response.text or ""
+            if is_daily_quota_error(text):
+                raise RuntimeError(
+                    "Gemini RPD/daily quota exhausted — cannot finish today. "
+                    "Retry tomorrow or upgrade Usage Tier. "
+                    f"Body: {text[:800]}"
+                )
+            wait = parse_retry_after_seconds(response)
+            quota_retries += 1
+            if quota_retries > MAX_QUOTA_RETRIES:
+                raise RuntimeError(
+                    f"Gemini RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} "
+                    f"waits (~{MAX_QUOTA_RETRIES} min). Body: {text[:800]}"
+                )
+            print(
+                f"HTTP 429 (RPM/TPM quota). Waiting {wait:.1f}s then auto-retry "
+                f"({quota_retries}/{MAX_QUOTA_RETRIES}) — no need to reopen PR",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+
+        if response.status_code in (500, 503):
+            transient_attempts += 1
+            if transient_attempts >= MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Gemini API failed with HTTP {response.status_code}: "
+                    f"{response.text[:1000]}"
+                )
+            time.sleep(2 ** (transient_attempts - 1))
             continue
 
         raise RuntimeError(
             f"Gemini API failed with HTTP {response.status_code}: "
             f"{response.text[:1000]}"
         )
-
-    raise RuntimeError(f"Gemini API failed after retries: {last_error}")
 
 
 def extract_usage(api_payload: dict[str, Any]) -> str:
