@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from typing import Any
 
 import requests
@@ -445,6 +446,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
     current_file = ""
     new_line_no: int | None = None
     review_chunks: list[str] = []
+    review_by_file: "OrderedDict[str, list[str]]" = OrderedDict()
     seen: set[str] = set()
     skip_indices: set[int] = set()
 
@@ -515,6 +517,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 if dedupe_key not in seen:
                     seen.add(dedupe_key)
                     review_chunks.append(chunk)
+                    review_by_file.setdefault(path_label, []).append(chunk)
                 continue
 
             # Bare key / KEY = ( without visible value yet — wait for value line.
@@ -545,7 +548,9 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
             seen.add(dedupe_key)
             header = f"# file: {path_label}\n# line: {line_no}"
-            review_chunks.append(f"{header}\n{body}")
+            chunk = f"{header}\n{body}"
+            review_chunks.append(chunk)
+            review_by_file.setdefault(path_label, []).append(chunk)
             continue
 
         if line.startswith("-") and not line.startswith("---"):
@@ -567,8 +572,12 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             }
         )
 
+    review_by_file_text = {
+        path: "\n\n".join(chunks) for path, chunks in review_by_file.items() if chunks
+    }
     return {
         "review_text": "\n\n".join(review_chunks),
+        "review_by_file": review_by_file_text,
         "files": files_out,
         "_added_line_details": {
             path: files_map[path]["added_lines"] for path in files_order
@@ -867,6 +876,121 @@ def extract_usage(api_payload: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "N/A"
 
 
+
+def split_into_batches(review_text: str, limit: int = MAX_REVIEW_CHARS) -> list[str]:
+    """Split one file's review text into API-sized batches on chunk boundaries."""
+    if not review_text.strip():
+        return []
+    if len(review_text) <= limit:
+        return [review_text]
+
+    parts = review_text.split("\n\n")
+    batches: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for part in parts:
+        part_len = len(part)
+        if part_len > limit:
+            if current:
+                batches.append("\n\n".join(current))
+                current, current_len = [], 0
+            truncated, _ = truncate_review_text(part, limit)
+            batches.append(truncated)
+            continue
+        sep = 2 if current else 0
+        if current and current_len + sep + part_len > limit:
+            batches.append("\n\n".join(current))
+            current = [part]
+            current_len = part_len
+        else:
+            current.append(part)
+            current_len += sep + part_len
+    if current:
+        batches.append("\n\n".join(current))
+    return batches
+
+
+def postprocess_issues(
+    issues: list[dict[str, Any]],
+    added_details: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Attach locations, drop syntax FPs / bad placeholders, force identifier LOW."""
+    issues = attach_locations(issues, added_details)
+    kept, dropped = filter_userfacing_issues(issues)
+    if dropped:
+        print(
+            f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
+            file=sys.stderr,
+        )
+    kept, ph_dropped = filter_placeholder_mismatches(kept)
+    if ph_dropped:
+        print(
+            f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
+            f"(suggestion must not add/remove placeholders like %d / {{id}})",
+            file=sys.stderr,
+        )
+        for bad in ph_dropped[:5]:
+            print(
+                f"  drop: original={bad.get('original')!r} "
+                f"suggestion={bad.get('suggestion')!r}",
+                file=sys.stderr,
+            )
+    id_low = sum(
+        1
+        for issue in kept
+        if issue["severity"] == SEVERITY_LOW
+        and "identifier" in issue.get("problem", "").lower()
+    )
+    if id_low:
+        print(
+            f"Downgraded {id_low} constant-name / identifier issue(s) to low",
+            file=sys.stderr,
+        )
+    return kept
+
+
+def review_by_file_sessions(
+    api_key: str,
+    review_by_file: dict[str, str],
+) -> tuple[list[dict[str, Any]], float, bool, list[str]]:
+    """One Gemini session per file (and per batch if a file is still too large)."""
+    all_issues: list[dict[str, Any]] = []
+    total_duration = 0.0
+    any_truncated = False
+    usages: list[str] = []
+
+    for path, text in review_by_file.items():
+        if not text.strip():
+            continue
+        batches = split_into_batches(text)
+        print(
+            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es)",
+            file=sys.stderr,
+        )
+        for i, batch in enumerate(batches, 1):
+            if len(batch) > MAX_REVIEW_CHARS:
+                batch, was_trunc = truncate_review_text(batch)
+                any_truncated = any_truncated or was_trunc
+            if len(batches) > 1:
+                print(
+                    f"  batch {i}/{len(batches)}: {len(batch)} chars",
+                    file=sys.stderr,
+                )
+                any_truncated = True
+            prompt = build_prompt(batch)
+            api_payload, duration = call_gemini(api_key, prompt)
+            total_duration += duration
+            usages.append(extract_usage(api_payload))
+            raw_text = extract_response_text(api_payload)
+            parsed = parse_model_json(raw_text)
+            for issue in parsed["issues"]:
+                if not issue.get("file"):
+                    issue["file"] = path
+            all_issues.extend(parsed["issues"])
+
+    return all_issues, total_duration, any_truncated, usages
+
+
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {"has_issue": False, "issues": [], "files": files or []}
 
@@ -920,11 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
 
     analyzed = analyze_diff(diff_text)
     files = analyzed["files"]
-    review_text = analyzed["review_text"]
+    review_by_file = analyzed.get("review_by_file") or {}
     added_details = analyzed.get("_added_line_details") or {}
     print_files_report(files)
 
-    if not review_text.strip():
+    if not any(text.strip() for text in review_by_file.values()):
         print(
             "No added lines to review under scoped diff — skip Gemini API",
             file=sys.stderr,
@@ -941,22 +1065,13 @@ def main(argv: list[str] | None = None) -> int:
         print_result_json(empty_result(files))
         return 0
 
-    truncated = False
-    if len(review_text) > MAX_REVIEW_CHARS:
-        review_text, truncated = truncate_review_text(review_text)
-        print(
-            f"Review text truncated to {len(review_text)} characters "
-            f"(limit {MAX_REVIEW_CHARS})",
-            file=sys.stderr,
-        )
-
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         summary = format_step_summary(
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=truncated,
+            truncated=False,
             extra_note="GEMINI_API_KEY is missing",
             files=files,
         )
@@ -966,51 +1081,22 @@ def main(argv: list[str] | None = None) -> int:
             result=empty_result(files),
         )
 
-    prompt = build_prompt(review_text)
     try:
-        api_payload, duration = call_gemini(api_key, prompt)
-        raw_text = extract_response_text(api_payload)
-        result = parse_model_json(raw_text)
-        result["issues"] = attach_locations(result["issues"], added_details)
-        kept, dropped = filter_userfacing_issues(result["issues"])
-        if dropped:
-            print(
-                f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
-                file=sys.stderr,
-            )
-        kept, ph_dropped = filter_placeholder_mismatches(kept)
-        if ph_dropped:
-            print(
-                f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
-                f"(suggestion must not add/remove placeholders like %d / {{id}})",
-                file=sys.stderr,
-            )
-            for bad in ph_dropped[:5]:
-                print(
-                    f"  drop: original={bad.get('original')!r} "
-                    f"suggestion={bad.get('suggestion')!r}",
-                    file=sys.stderr,
-                )
-        id_low = sum(
-            1
-            for issue in kept
-            if issue["severity"] == SEVERITY_LOW
-            and "identifier" in issue.get("problem", "").lower()
+        raw_issues, duration, truncated, usages = review_by_file_sessions(
+            api_key, review_by_file
         )
-        if id_low:
-            print(
-                f"Downgraded {id_low} constant-name / identifier issue(s) to low",
-                file=sys.stderr,
-            )
-        result["issues"] = kept
-        result["has_issue"] = bool(kept)
-        result["files"] = files
+        kept = postprocess_issues(raw_issues, added_details)
+        result = {
+            "has_issue": bool(kept),
+            "issues": kept,
+            "files": files,
+        }
     except Exception as exc:  # noqa: BLE001 — fail-closed for infrastructure errors
         summary = format_step_summary(
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=truncated,
+            truncated=False,
             extra_note=f"fail-closed: {exc}",
             files=files,
         )
@@ -1020,13 +1106,12 @@ def main(argv: list[str] | None = None) -> int:
             result=empty_result(files),
         )
 
-    issues = result["issues"]
-    usage = extract_usage(api_payload)
-    blocked = has_blocking_issues(issues)
+    usage = "; ".join(u for u in usages if u and u != "N/A") or "N/A"
+    blocked = has_blocking_issues(kept)
     status = "FAILED" if blocked else "PASSED"
     summary = format_step_summary(
         status=status,
-        issues=issues,
+        issues=kept,
         duration_sec=duration,
         truncated=truncated,
         usage=usage,
@@ -1039,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Blocking HIGH severity issues found", file=sys.stderr)
         return 1
     return 0
+
 
 
 if __name__ == "__main__":
