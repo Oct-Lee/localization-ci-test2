@@ -1,4 +1,4 @@
-POST_PROCESS_ERROR = "无法加载后处理代码"
+POST_PROCESS_ERROR = "无法加载后处理 代码"
 CANNOT_BACKTEST_WHILE_TRAINING = "在训练的时候不能跑模型模拟"
 CANNOT_FIND_CLASS_NAME_SHOULD_TRAIN_SCRATCH = (
     "无法找到缺陷种类，可能是由于新添加了缺陷种类。请从零训练。"
