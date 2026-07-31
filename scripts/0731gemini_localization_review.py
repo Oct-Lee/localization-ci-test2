@@ -17,36 +17,25 @@ import re
 import sys
 import time
 from collections import OrderedDict
-from typing import Any, NamedTuple
+from typing import Any
 
 import requests
 
-# Ordered failover chain. Quotas differ by model — pacing follows the active one.
-# Gemini 3 Flash API id is currently gemini-3-flash-preview.
-class GeminiModelQuota(NamedTuple):
-    model_id: str
-    rpm: int
-    rpd: int
-    tpm: int | None = None  # None = not relied on for pacing
-
-
-GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
-    GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
-    GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
-    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
-    GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
+MODEL_ID = "gemini-3.1-flash-lite"
+GEMINI_ENDPOINT = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{MODEL_ID}:generateContent"
 )
-GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
-MODEL_ID = GEMINI_MODELS[0]  # primary; kept for docs/compat
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 RETRYABLE_STATUS = {429, 500, 503}
 MAX_REVIEW_CHARS = 100_000
-# Primary-model defaults (compat for summary fields before any request).
-GEMINI_RPM_LIMIT = GEMINI_MODEL_QUOTAS[0].rpm
-GEMINI_TPM_LIMIT = GEMINI_MODEL_QUOTAS[0].tpm or 0
-GEMINI_RPD_LIMIT = GEMINI_MODEL_QUOTAS[0].rpd
+# Free-tier style limits (Gemini). Pace requests to stay under RPM.
+GEMINI_RPM_LIMIT = 15
+GEMINI_TPM_LIMIT = 250_000
+GEMINI_RPD_LIMIT = 500
+# Leave headroom vs hard 15 RPM (60/15=4s; use 4.1s).
+MIN_REQUEST_INTERVAL_SEC = 60.0 / GEMINI_RPM_LIMIT + 0.1
 # RPM/TPM: wait ~1 min (or API "retry in Xs") and retry in the same workflow.
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 40  # up to ~40 minutes of quota waits per request
@@ -55,57 +44,6 @@ DAILY_QUOTA_RE = re.compile(
     r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
     re.IGNORECASE,
 )
-
-# Sticky within one process: after failover, keep using the fallback model.
-_active_model_index = 0
-
-
-def reset_model_failover_state() -> None:
-    global _active_model_index
-    _active_model_index = 0
-
-
-def active_model_quota() -> GeminiModelQuota:
-    return GEMINI_MODEL_QUOTAS[_active_model_index]
-
-
-def active_model_id() -> str:
-    return active_model_quota().model_id
-
-
-def min_request_interval_sec(rpm: int | None = None) -> float:
-    """Leave slight headroom vs hard RPM (60/rpm + 0.1s)."""
-    limit = active_model_quota().rpm if rpm is None else rpm
-    return 60.0 / limit + 0.1
-
-
-# Compat alias: primary model interval.
-MIN_REQUEST_INTERVAL_SEC = min_request_interval_sec(GEMINI_RPM_LIMIT)
-
-
-def gemini_endpoint(model_id: str) -> str:
-    return (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model_id}:generateContent"
-    )
-
-
-def try_advance_model(reason: str) -> bool:
-    """Switch to the next Gemini model; return False if none left."""
-    global _active_model_index
-    if _active_model_index + 1 >= len(GEMINI_MODEL_QUOTAS):
-        return False
-    prev = GEMINI_MODEL_QUOTAS[_active_model_index]
-    _active_model_index += 1
-    nxt = GEMINI_MODEL_QUOTAS[_active_model_index]
-    print(
-        f"Gemini model failover: {prev.model_id} -> {nxt.model_id} "
-        f"(RPM={nxt.rpm}/RPD={nxt.rpd}; {reason})",
-        file=sys.stderr,
-    )
-    return True
-
-
 CONTEXT_LINES = 3
 PLACEHOLDER_RE = re.compile(r"\{[^}]+\}|%\w|\$\{[^}]+\}")
 FENCE_RE = re.compile(
@@ -848,27 +786,13 @@ def format_step_summary(
         f"- Token usage: {usage}",
     ]
     if usage_stats:
-        models = usage_stats.get("models_used") or []
-        models_s = ", ".join(models) if models else active_model_id()
-        model_limits = usage_stats.get("model_limits") or {}
-        if model_limits:
-            limits_s = "; ".join(
-                f"{mid} RPM={lim['rpm']}/RPD={lim['rpd']}"
-                + (f"/TPM={lim['tpm']}" if lim.get("tpm") else "")
-                for mid, lim in model_limits.items()
-            )
-        else:
-            limits_s = (
-                f"RPM={usage_stats['rpm_limit']} "
-                f"TPM={usage_stats['tpm_limit']} "
-                f"RPD={usage_stats['rpd_limit']}"
-            )
         lines.extend(
             [
-                f"- Models: {models_s}",
                 f"- API requests: {usage_stats['requests']} "
                 f"(paced ≥{usage_stats['min_interval_sec']:.1f}s; "
-                f"limits {limits_s})",
+                f"limits RPM={usage_stats['rpm_limit']} "
+                f"TPM={usage_stats['tpm_limit']} "
+                f"RPD={usage_stats['rpd_limit']})",
                 f"- Tokens: prompt={usage_stats['prompt_tokens']} "
                 f"candidates={usage_stats['candidates_tokens']} "
                 f"total={usage_stats['total_tokens']}",
@@ -950,18 +874,19 @@ def parse_retry_after_seconds(response: requests.Response) -> float:
 
 
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
-    """Call Gemini; RPM/TPM 429 wait+retry; RPD fail over to next model."""
+    """Call Gemini; on RPM/TPM 429 wait ~1 min and retry until success (same job)."""
+    url = f"{GEMINI_ENDPOINT}?key={api_key}"
     body = {"contents": [{"parts": [{"text": prompt}]}]}
+    last_error: Exception | None = None
     start = time.monotonic()
     quota_retries = 0
     transient_attempts = 0
 
     while True:
-        model_id = active_model_id()
-        url = f"{gemini_endpoint(model_id)}?key={api_key}"
         try:
             response = requests.post(url, json=body, timeout=HTTP_TIMEOUT_SEC)
         except requests.Timeout as exc:
+            last_error = exc
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
                 raise RuntimeError(
@@ -984,36 +909,21 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
         if response.status_code == 429:
             text = response.text or ""
             if is_daily_quota_error(text):
-                if try_advance_model(
-                    f"RPD/daily quota exhausted on {model_id}"
-                ):
-                    quota_retries = 0
-                    transient_attempts = 0
-                    continue
                 raise RuntimeError(
-                    "Gemini RPD/daily quota exhausted on all models "
-                    f"({', '.join(GEMINI_MODELS)}) — retry tomorrow or "
-                    "upgrade Usage Tier. "
+                    "Gemini RPD/daily quota exhausted — cannot finish today. "
+                    "Retry tomorrow or upgrade Usage Tier. "
                     f"Body: {text[:800]}"
                 )
             wait = parse_retry_after_seconds(response)
             quota_retries += 1
             if quota_retries > MAX_QUOTA_RETRIES:
-                if try_advance_model(
-                    f"RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} waits "
-                    f"on {model_id}"
-                ):
-                    quota_retries = 0
-                    transient_attempts = 0
-                    continue
                 raise RuntimeError(
                     f"Gemini RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} "
-                    f"waits on all models. Body: {text[:800]}"
+                    f"waits (~{MAX_QUOTA_RETRIES} min). Body: {text[:800]}"
                 )
             print(
-                f"HTTP 429 (RPM/TPM on {model_id}). Waiting {wait:.1f}s then "
-                f"auto-retry ({quota_retries}/{MAX_QUOTA_RETRIES}) "
-                f"— no need to reopen PR",
+                f"HTTP 429 (RPM/TPM quota). Waiting {wait:.1f}s then auto-retry "
+                f"({quota_retries}/{MAX_QUOTA_RETRIES}) — no need to reopen PR",
                 file=sys.stderr,
             )
             time.sleep(wait)
@@ -1074,8 +984,6 @@ def empty_usage_stats() -> dict[str, Any]:
         "chars_sent": 0,
         "chars_omitted": 0,
         "files_reviewed": 0,
-        "models_used": [],
-        "model_limits": {},
         "rpm_limit": GEMINI_RPM_LIMIT,
         "tpm_limit": GEMINI_TPM_LIMIT,
         "rpd_limit": GEMINI_RPD_LIMIT,
@@ -1083,41 +991,11 @@ def empty_usage_stats() -> dict[str, Any]:
     }
 
 
-def record_model_usage(stats: dict[str, Any], quota: GeminiModelQuota) -> None:
-    mid = quota.model_id
-    if mid not in stats["models_used"]:
-        stats["models_used"].append(mid)
-    stats["model_limits"][mid] = {
-        "rpm": quota.rpm,
-        "rpd": quota.rpd,
-        "tpm": quota.tpm,
-        "min_interval_sec": min_request_interval_sec(quota.rpm),
-    }
-    # Summary fields track the model used most recently (pacing source).
-    stats["rpm_limit"] = quota.rpm
-    stats["rpd_limit"] = quota.rpd
-    stats["tpm_limit"] = quota.tpm or 0
-    stats["min_interval_sec"] = min_request_interval_sec(quota.rpm)
-
-
 def format_usage_summary(stats: dict[str, Any]) -> str:
-    models = stats.get("models_used") or []
-    models_s = ",".join(models) if models else active_model_id()
-    model_limits = stats.get("model_limits") or {}
-    if model_limits:
-        limits_s = ";".join(
-            f"{mid}:RPM={lim['rpm']}/RPD={lim['rpd']}"
-            for mid, lim in model_limits.items()
-        )
-    else:
-        limits_s = (
-            f"RPM={stats['rpm_limit']}/TPM={stats['tpm_limit']}/"
-            f"RPD={stats['rpd_limit']}"
-        )
     return (
         f"requests={stats['requests']} "
-        f"(limits {limits_s}), "
-        f"models={models_s}, "
+        f"(limit RPM={stats['rpm_limit']}/TPM={stats['tpm_limit']}/"
+        f"RPD={stats['rpd_limit']}), "
         f"prompt_tokens={stats['prompt_tokens']}, "
         f"candidates_tokens={stats['candidates_tokens']}, "
         f"total_tokens={stats['total_tokens']}, "
@@ -1216,9 +1094,9 @@ def review_by_file_sessions(
 ) -> tuple[list[dict[str, Any]], float, bool, dict[str, Any]]:
     """One Gemini session per file (and per batch if a file is still too large).
 
-    Requests are paced to the active model's RPM. Issues from all successful
-    batches are merged. Content is only omitted when a single entry exceeds
-    MAX_REVIEW_CHARS (logged via chars_omitted).
+    Requests are paced to stay under GEMINI_RPM_LIMIT. Issues from all
+    successful batches are merged. Content is only omitted when a single
+    entry exceeds MAX_REVIEW_CHARS (logged via chars_omitted).
     """
     all_issues: list[dict[str, Any]] = []
     total_duration = 0.0
@@ -1249,15 +1127,13 @@ def review_by_file_sessions(
                     file=sys.stderr,
                 )
 
-            # Pace to respect the active model's RPM (also spaces TPM bursts).
-            quota = active_model_quota()
-            interval = min_request_interval_sec(quota.rpm)
+            # Pace to respect RPM (also spaces TPM bursts).
             if last_request_at > 0:
-                wait = interval - (time.monotonic() - last_request_at)
+                wait = MIN_REQUEST_INTERVAL_SEC - (time.monotonic() - last_request_at)
                 if wait > 0:
                     print(
                         f"  rate-limit pace: sleeping {wait:.1f}s "
-                        f"(RPM≤{quota.rpm} on {quota.model_id})",
+                        f"(RPM≤{GEMINI_RPM_LIMIT})",
                         file=sys.stderr,
                     )
                     time.sleep(wait)
@@ -1267,7 +1143,6 @@ def review_by_file_sessions(
             last_request_at = time.monotonic()
             total_duration += duration
             stats["requests"] += 1
-            record_model_usage(stats, active_model_quota())
             stats["chars_sent"] += len(batch)
             counts = extract_usage_counts(api_payload)
             stats["prompt_tokens"] += counts.get("prompt", 0)
@@ -1316,7 +1191,6 @@ def fail(
 
 
 def main(argv: list[str] | None = None) -> int:
-    reset_model_failover_state()
     args = argv if argv is not None else sys.argv[1:]
     if len(args) != 1:
         return fail("Usage: python scripts/gemini_localization_review.py <diff_file>")
