@@ -82,6 +82,16 @@ def try_advance_model(reason: str) -> bool:
     return True
 
 
+def pace_after_model_failover() -> None:
+    """Wait one full interval for the new model before the next request."""
+    wait = min_request_interval_sec()
+    print(
+        f"Post-failover pace: sleeping {wait:.1f}s before next request on {active_model_id()}",
+        file=sys.stderr,
+    )
+    time.sleep(wait)
+
+
 CONTEXT_LINES = 3
 PLACEHOLDER_RE = re.compile(r"\{[^}]+\}|%\w|\$\{[^}]+\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
@@ -89,6 +99,9 @@ PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
+PY_TRIPLE_OPEN_RE = re.compile(
+    rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
+)
 STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])(.*)\1\s*,?\s*$""")
 ASSIGNMENT_LINE_RE = re.compile(rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""", re.DOTALL)
 JSON_KV_RE = re.compile(r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$""")
@@ -105,10 +118,6 @@ SYNTAX_PROBLEM_RE = re.compile(
 SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW = "high", "medium", "low"
 VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-# Deterministic safety net when Gemini misses a known VALUE typo (not a prompt list).
-KNOWN_VALUE_TYPOS: tuple[tuple[str, str, str], ...] = (
-    ("神经网路", "神经网络", "Spelling: 神经网路 should be 神经网络"),
-)
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
 _ID_PROBLEM_TOKENS = (
     "identifier", "constant name", "key name", "object key", "property name",
@@ -135,12 +144,13 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["has_issue", "issues"],
 }
-# Minimal task brief; filtering / severity policy lives in code + responseSchema.
-_PROMPT_BRIEF = (
-    "Review user-facing string VALUES only (EN / zh-CN / pt-PT) in the PR hunks below. "
-    "Flag spelling/grammar as high, wording as medium, value casing/style as low. "
-    "Ignore syntax and key/identifier names. Keep placeholders unchanged."
-)
+# Brief + 2 short examples; policy details live in code + responseSchema.
+_PROMPT_BRIEF = """Review user-facing string VALUES only (EN / zh-CN / pt-PT).
+Severity: spelling/grammar → high; wording → medium; value casing/style → low.
+Ignore syntax and key/identifier names. Keep placeholders unchanged.
+Examples:
+- good: original "File Camera not select" → suggestion "File Camera not selected" (high)
+- skip: key rename CONSOLE_lOG_* / FLEX_LIGNT_* (not a VALUE issue)"""
 
 
 def build_prompt(review_text: str) -> str:
@@ -299,10 +309,11 @@ def _new_file_entry(path: str) -> dict[str, Any]:
 
 
 def _peek_multiline_string_value(
-    lines: list[str], start_idx: int, *, concatenate: bool = False, max_scan: int = 40,
+    lines: list[str], start_idx: int, *, concatenate: bool = False, max_scan: int | None = None,
 ) -> tuple[list[int], str, int] | None:
+    """Collect following +'...' lines. max_scan=None scans until hunk/meta/non-match."""
     skip, parts, first_value_idx = [], [], None
-    end = min(len(lines), start_idx + 1 + max_scan)
+    end = len(lines) if max_scan is None else min(len(lines), start_idx + 1 + max_scan)
     for j in range(start_idx + 1, end):
         candidate = lines[j]
         if candidate.startswith(("---", "+++", "@@")) or (candidate.startswith(" ") and parts):
@@ -329,6 +340,39 @@ def _peek_multiline_string_value(
     if not parts or first_value_idx is None:
         return None
     return skip, "".join(parts), first_value_idx
+
+
+def _peek_triple_quoted_string(
+    lines: list[str], start_idx: int, quote: str, rest: str,
+) -> tuple[list[int], str, int] | None:
+    """Parse KEY = \"\"\"...\"\"\" spanning one or more +diff lines."""
+    pieces: list[str] = []
+    skip: list[int] = []
+    first_value_idx = start_idx
+    if rest:
+        if rest.endswith(quote):
+            return [], rest[: -len(quote)], start_idx
+        pieces.append(rest)
+
+    for j in range(start_idx + 1, len(lines)):
+        candidate = lines[j]
+        if candidate.startswith(("---", "+++", "@@")):
+            break
+        if candidate.startswith("-"):
+            continue
+        if not candidate.startswith("+"):
+            break
+        text = candidate[1:]
+        skip.append(j)
+        if not pieces:
+            first_value_idx = j
+        if quote in text:
+            before, _, _after = text.partition(quote)
+            pieces.append(before)
+            value = "\n".join(pieces).rstrip("\n")
+            return skip, value, first_value_idx
+        pieces.append(text)
+    return None
 
 
 def analyze_diff(diff_text: str) -> dict[str, Any]:
@@ -374,6 +418,26 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             if idx in skip_indices:
                 continue
             path_label = current_file or "(unknown)"
+            if triple := PY_TRIPLE_OPEN_RE.match(text):
+                merged_triple = _peek_triple_quoted_string(
+                    lines, idx, triple.group("q"), triple.group("rest"),
+                )
+                if merged_triple is not None:
+                    skip_idxs, string_val, first_value_idx = merged_triple
+                    skip_indices.update(skip_idxs)
+                    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+                    key_name = triple.group(1)
+                    chunk = _multiline_review_chunk(
+                        path_label, value_line_no, [string_val], key_name=key_name,
+                        note="python triple-quoted string",
+                        source_line=f"+  {key_name} = {triple.group('q')}...{triple.group('q')}",
+                    )
+                    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+                    if dedupe_key not in seen:
+                        seen.add(dedupe_key)
+                        review_chunks.append(chunk)
+                        review_by_file.setdefault(path_label, []).append(chunk)
+                    continue
             key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
             merged_value = None
             if key_only or py_open:
@@ -624,18 +688,18 @@ def _md_cell(value: str) -> str:
 
 def format_step_summary(
     *, status: str, issues: list[dict[str, Any]], duration_sec: float | None,
-    truncated: bool, usage: str = "N/A", extra_note: str = "",
+    usage: str = "N/A", extra_note: str = "",
     files: list[dict[str, Any]] | None = None, usage_stats: dict[str, Any] | None = None,
+    truncated: bool = False,  # retained for call-site compat; unused (no silent omit)
 ) -> str:
+    del truncated  # no truncation path; batches cover full text
     counts = count_by_severity(issues)
     duration = f"{duration_sec:.1f}s" if duration_sec is not None else "N/A"
-    omitted = (usage_stats or {}).get("chars_omitted", 0)
     lines = [
         "## Localization Quality Gate", "",
         f"- Status: {status}",
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} | Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Truncated: {'yes' if truncated else 'no'}" + (f" (omitted {omitted} chars)" if omitted else ""),
         f"- Token usage: {usage}",
     ]
     if usage_stats:
@@ -644,7 +708,7 @@ def format_step_summary(
             f"- Models: {models_s}",
             f"- API requests: {usage_stats['requests']} (paced ≥{usage_stats['min_interval_sec']:.1f}s; limits {limits_s})",
             f"- Tokens: prompt={usage_stats['prompt_tokens']} candidates={usage_stats['candidates_tokens']} total={usage_stats['total_tokens']}",
-            f"- Review payload: sent={usage_stats['chars_sent']} chars, omitted={usage_stats['chars_omitted']} chars, "
+            f"- Review payload: sent={usage_stats['chars_sent']} chars, "
             f"batches={usage_stats['batches']}, files={usage_stats['files_reviewed']}",
         ])
     if extra_note:
@@ -743,6 +807,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             if is_daily_quota_error(text):
                 if try_advance_model(f"RPD/daily quota exhausted on {model_id}"):
                     quota_retries = transient_attempts = 0
+                    pace_after_model_failover()
                     continue
                 raise RuntimeError(
                     "Gemini RPD/daily quota exhausted on all models "
@@ -754,6 +819,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             if quota_retries > MAX_QUOTA_RETRIES:
                 if try_advance_model(f"RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} waits on {model_id}"):
                     quota_retries = transient_attempts = 0
+                    pace_after_model_failover()
                     continue
                 raise RuntimeError(
                     f"Gemini RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} waits on all models. "
@@ -802,7 +868,7 @@ def empty_usage_stats() -> dict[str, Any]:
     primary = GEMINI_MODEL_QUOTAS[0]
     return {
         "requests": 0, "prompt_tokens": 0, "candidates_tokens": 0, "total_tokens": 0,
-        "batches": 0, "chars_sent": 0, "chars_omitted": 0, "files_reviewed": 0,
+        "batches": 0, "chars_sent": 0, "files_reviewed": 0,
         "models_used": [], "model_limits": {},
         "rpm_limit": primary.rpm, "tpm_limit": primary.tpm or 0, "rpd_limit": primary.rpd,
         "min_interval_sec": min_request_interval_sec(primary.rpm),
@@ -850,17 +916,54 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
         f"requests={stats['requests']} (limits {limits_s}), models={models_s}, "
         f"prompt_tokens={stats['prompt_tokens']}, candidates_tokens={stats['candidates_tokens']}, "
         f"total_tokens={stats['total_tokens']}, chars_sent={stats['chars_sent']}, "
-        f"chars_omitted={stats['chars_omitted']}, batches={stats['batches']}, "
+        f"batches={stats['batches']}, "
         f"files={stats['files_reviewed']}, pace>={stats['min_interval_sec']:.1f}s/req"
     )
 
 
 def split_into_batches(review_text: str, limit: int | None = None) -> list[str]:
+    """Pack whole review chunks (\\n\\n-separated). Only hard-split a chunk if it alone exceeds limit."""
     if limit is None:
         limit = MAX_REVIEW_CHARS
     if not review_text.strip():
         return []
-    return split_text_for_limit(review_text, limit)
+    chunks = [c for c in review_text.split("\n\n") if c.strip()]
+    if not chunks:
+        return []
+    batches: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    sep = "\n\n"
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if current:
+            batches.append(sep.join(current))
+            current, current_len = [], 0
+
+    for chunk in chunks:
+        if len(chunk) > limit:
+            flush()
+            hard = split_text_for_limit(chunk, limit)
+            # Overlap last CONTEXT_LINES of previous hard piece into the next.
+            for i, piece in enumerate(hard):
+                if i == 0:
+                    batches.append(piece)
+                    continue
+                prev_tail = "\n".join(hard[i - 1].splitlines()[-CONTEXT_LINES:])
+                merged = f"{prev_tail}\n{piece}" if prev_tail else piece
+                if len(merged) <= limit:
+                    batches.append(merged)
+                else:
+                    batches.append(piece)
+            continue
+        add_len = len(chunk) + (len(sep) if current else 0)
+        if current and current_len + add_len > limit:
+            flush()
+        current.append(chunk)
+        current_len += len(chunk) + (len(sep) if current_len else 0)
+    flush()
+    return batches
 
 
 def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -> str:
@@ -868,38 +971,6 @@ def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -
     if batch_index == 0 or batch.lstrip().startswith("# file:"):
         return batch
     return f"# file: {path}\n# note: continuation of previous batch\n\n{batch}"
-
-
-def deterministic_known_typo_issues(
-    added_details: dict[str, list[dict[str, Any]]],
-) -> list[dict[str, Any]]:
-    found, seen = [], set()
-    for path, rows in added_details.items():
-        for row in rows:
-            for value in extract_user_facing_hints(row.get("text", ""), path):
-                for wrong, right, problem in KNOWN_VALUE_TYPOS:
-                    if wrong not in value:
-                        continue
-                    key = (path, int(row.get("line", -1)), value)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    found.append({
-                        "file": path, "line": key[1], "original": value, "problem": problem,
-                        "suggestion": value.replace(wrong, right), "severity": SEVERITY_HIGH,
-                    })
-    return found
-
-
-def merge_issues(primary: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    keys = {(i.get("file"), i.get("original"), i.get("suggestion")) for i in primary}
-    merged = list(primary)
-    for issue in extra:
-        key = (issue.get("file"), issue.get("original"), issue.get("suggestion"))
-        if key not in keys:
-            merged.append(issue)
-            keys.add(key)
-    return merged
 
 
 def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False) -> None:
@@ -928,18 +999,12 @@ def postprocess_issues(
             "(suggestion must not add/remove placeholders like %d / {id})",
             show_samples=True,
         )
-    known = deterministic_known_typo_issues(added_details)
-    if known:
-        before = len(kept)
-        kept = merge_issues(kept, known)
-        if len(kept) - before:
-            print(f"Added {len(kept) - before} known typo issue(s) via deterministic safety net", file=sys.stderr)
     return kept
 
 
 def review_by_file_sessions(
     api_key: str, review_by_file: dict[str, str],
-) -> tuple[list[dict[str, Any]], float, bool, dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
     for path, text in review_by_file.items():
         if not text.strip():
@@ -981,7 +1046,7 @@ def review_by_file_sessions(
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
     print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
-    return all_issues, total_duration, False, stats
+    return all_issues, total_duration, stats
 
 
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1002,7 +1067,7 @@ def fail(message: str, *, summary: str | None = None, result: dict[str, Any] | N
 
 def _passed_summary(extra_note: str, files: list[dict[str, Any]] | None = None) -> str:
     return format_step_summary(
-        status="PASSED", issues=[], duration_sec=None, truncated=False,
+        status="PASSED", issues=[], duration_sec=None,
         extra_note=extra_note, files=files or [],
     )
 
@@ -1037,27 +1102,27 @@ def main(argv: list[str] | None = None) -> int:
         return fail(
             "GEMINI_API_KEY is missing",
             summary=format_step_summary(
-                status="FAILED", issues=[], duration_sec=None, truncated=False,
+                status="FAILED", issues=[], duration_sec=None,
                 extra_note="GEMINI_API_KEY is missing", files=files,
             ),
             result=empty_result(files),
         )
     try:
-        raw_issues, duration, truncated, usage_stats = review_by_file_sessions(api_key, review_by_file)
+        raw_issues, duration, usage_stats = review_by_file_sessions(api_key, review_by_file)
         kept = postprocess_issues(raw_issues, added_details)
         result = {"has_issue": bool(kept), "issues": kept, "files": files}
-    except Exception as exc:  # noqa: BLE001
+    except (ValueError, RuntimeError, OSError, requests.RequestException) as exc:
         return fail(
             f"Localization gate failed: {exc}",
             summary=format_step_summary(
-                status="FAILED", issues=[], duration_sec=None, truncated=False,
+                status="FAILED", issues=[], duration_sec=None,
                 extra_note=f"fail-closed: {exc}", files=files,
             ),
             result=empty_result(files),
         )
     append_step_summary(format_step_summary(
         status="FAILED" if has_blocking_issues(kept) else "PASSED",
-        issues=kept, duration_sec=duration, truncated=truncated,
+        issues=kept, duration_sec=duration,
         usage=format_usage_summary(usage_stats), usage_stats=usage_stats, files=files,
     ))
     print_result_json(result)
