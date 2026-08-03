@@ -42,9 +42,6 @@ GEMINI_API_BASE = (
     "https://generativelanguage.googleapis.com/v1beta/models"
 )
 MAX_REVIEW_CHARS = 100_000
-# Prefer smaller batches so the model does not miss mid-file value issues
-# on large translation files (still never omits content).
-PREFERRED_BATCH_CHARS = 12_000
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 # RPM/TPM: wait ~1 min (or API "retry in Xs") and retry in the same workflow.
@@ -666,6 +663,36 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
 
             hints = extract_user_facing_hints(text, path_label)
+            if hints:
+                # Compact entry: only annotate values. Neighboring ±CONTEXT lines
+                # inflate payload and can hide typos (e.g. 神经网路 next to 神经网络).
+                key_name = None
+                stripped = text.strip()
+                assign_m = ASSIGNMENT_LINE_RE.match(stripped)
+                if assign_m:
+                    key_name = assign_m.group(1)
+                else:
+                    json_m = JSON_KV_RE.match(stripped)
+                    if json_m:
+                        key_name = json_m.group(1)
+                header_parts = [
+                    f"# file: {path_label}",
+                    f"# line: {line_no}",
+                ]
+                if key_name:
+                    header_parts.append(f"# key: {key_name}")
+                body = "\n".join(
+                    header_parts + [f"user_facing: {h}" for h in hints]
+                )
+                dedupe_key = f"{path_label}:{line_no}:{body}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                review_chunks.append(body)
+                review_by_file.setdefault(path_label, []).append(body)
+                continue
+
+            # No extractable value — keep a small context window for rare cases.
             start = max(0, idx - CONTEXT_LINES)
             end = min(len(lines), idx + CONTEXT_LINES + 1)
             window: list[str] = []
@@ -676,11 +703,9 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 if candidate.startswith("@@"):
                     continue
                 window.append(candidate)
-            if not window and not hints:
+            if not window:
                 continue
-            body = "\n".join(window) if window else f"+{text}"
-            if hints:
-                body = body + "\n" + "\n".join(f"user_facing: {h}" for h in hints)
+            body = "\n".join(window)
             dedupe_key = f"{path_label}:{line_no}:{body}"
             if dedupe_key in seen:
                 continue
@@ -1173,13 +1198,12 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
 
 
 def split_into_batches(
-    review_text: str, limit: int = PREFERRED_BATCH_CHARS
+    review_text: str, limit: int = MAX_REVIEW_CHARS
 ) -> list[str]:
     """Split one file's review text into API-sized batches on chunk boundaries.
 
-    Default ``limit`` is PREFERRED_BATCH_CHARS for better model recall on large
-    translation files. Oversized single chunks are hard-split so **all** content
-    is reviewed (nothing is omitted). Hard pieces never exceed MAX_REVIEW_CHARS.
+    Oversized single chunks are hard-split so **all** content is reviewed
+    (nothing is omitted).
     """
     if not review_text.strip():
         return []
