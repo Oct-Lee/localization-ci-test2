@@ -35,9 +35,20 @@ GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
-MAX_REVIEW_CHARS = 100_000  # 0803-proven batch size; pair with ±CONTEXT_LINES overlap for recall
+MAX_REVIEW_CHARS = 100_000  # default batch size for large EN packs
+# Locale/short files: pack chunks so each file uses about 1–FOCUSED_TARGET_BATCHES API calls.
+FOCUSED_TARGET_BATCHES = 3
+SHORT_FILE_MAX_CHUNKS = 40
+SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 40
+CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused batches
+# Paths that need smaller focused batches for CJK/PT recall.
+_FOCUSED_PATH_RE = re.compile(
+    r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
+    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.)",
+    re.IGNORECASE,
+)
 RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
 DAILY_QUOTA_RE = re.compile(
     r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
@@ -92,7 +103,6 @@ def pace_after_model_failover() -> None:
     time.sleep(wait)
 
 
-CONTEXT_LINES = 3
 PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|%\w|\$\{[^}]*\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -168,6 +178,8 @@ Rules:
 3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
 4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
 5) Leading/trailing whitespace style → severity "low" only (never high/medium).
+6) Inspect EVERY user_facing VALUE carefully (character-level). Catch CJK near-misses
+   (网路→网络), missing/extra Latin letters, wrong words — do not skip any tagged line.
 Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
 
 Examples:
@@ -593,7 +605,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             if should_skip_review_line(text):
                 continue
             hints = extract_user_facing_hints(text, path_label)
-            # Keep ±CONTEXT_LINES neighbors (same as 0803): overlapping windows improve Chinese recall.
+            # Keep ±CONTEXT_LINES neighbors; keep small to avoid diluting model attention.
             start, end = max(0, idx - CONTEXT_LINES), min(len(lines), idx + CONTEXT_LINES + 1)
             window = [
                 lines[j] for j in range(start, end)
@@ -1055,15 +1067,46 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
     )
 
 
-def split_into_batches(review_text: str, limit: int | None = None) -> list[str]:
+def review_chunks(review_text: str) -> list[str]:
+    return [c for c in review_text.split("\n\n") if c.strip()]
+
+
+def prefers_focused_batches(path: str, review_text: str) -> bool:
+    """Chinese/PT locale paths, or short files: use ~1–FOCUSED_TARGET_BATCHES requests."""
+    if _FOCUSED_PATH_RE.search(path or ""):
+        return True
+    chunks = review_chunks(review_text)
+    return (
+        0 < len(chunks) <= SHORT_FILE_MAX_CHUNKS
+        and len(review_text) <= SHORT_FILE_MAX_CHARS
+    )
+
+
+def focused_max_chunks_per_batch(chunk_count: int) -> int:
+    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests."""
+    if chunk_count <= 0:
+        return 1
+    if chunk_count <= FOCUSED_TARGET_BATCHES:
+        return chunk_count  # single request
+    return (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
+
+
+def split_into_batches(
+    review_text: str,
+    limit: int | None = None,
+    *,
+    max_chunks_per_batch: int | None = None,
+) -> list[str]:
     """Pack whole review chunks (\\n\\n-separated). Only hard-split a chunk if it alone exceeds limit."""
     if limit is None:
         limit = MAX_REVIEW_CHARS
     if not review_text.strip():
         return []
-    chunks = [c for c in review_text.split("\n\n") if c.strip()]
+    chunks = review_chunks(review_text)
     if not chunks:
         return []
+    if max_chunks_per_batch is not None and max_chunks_per_batch <= 0:
+        raise ValueError("max_chunks_per_batch must be positive when set")
     batches: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -1092,7 +1135,10 @@ def split_into_batches(review_text: str, limit: int | None = None) -> list[str]:
                     batches.append(piece)
             continue
         add_len = len(chunk) + (len(sep) if current else 0)
-        if current and current_len + add_len > limit:
+        chunk_cap = (
+            max_chunks_per_batch is not None and len(current) >= max_chunks_per_batch
+        )
+        if current and (current_len + add_len > limit or chunk_cap):
             flush()
         current.append(chunk)
         current_len += len(chunk) + (len(sep) if current_len else 0)
@@ -1170,11 +1216,19 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        batches = split_into_batches(text)
+        focused = prefers_focused_batches(path, text)
+        chunks = review_chunks(text)
+        pack = focused_max_chunks_per_batch(len(chunks)) if focused else None
+        batches = split_into_batches(text, max_chunks_per_batch=pack)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
+        mode = (
+            f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
+            if focused
+            else "packed"
+        )
         print(
-            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es)",
+            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es), {mode}",
             file=sys.stderr,
         )
         for i, raw_batch in enumerate(batches):
