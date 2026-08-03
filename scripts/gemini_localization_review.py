@@ -42,7 +42,7 @@ MODEL_ID = GEMINI_MODELS[0]  # primary; kept for docs/compat
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 RETRYABLE_STATUS = {429, 500, 503}
-MAX_REVIEW_CHARS = 100_000
+MAX_REVIEW_CHARS = 4_000  # smaller batches = better typo recall on dense i18n files
 # Primary-model defaults (compat for summary fields before any request).
 GEMINI_RPM_LIMIT = GEMINI_MODEL_QUOTAS[0].rpm
 GEMINI_TPM_LIMIT = GEMINI_MODEL_QUOTAS[0].tpm or 0
@@ -165,7 +165,10 @@ Monorepo formats you will see:
 - Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
 - JSON:  "confirm": "Confirm"
 - CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
-When a line is annotated with "user_facing: ...", review that text first.
+When a line is annotated with "user_facing: ...", you MUST review that text.
+Check EVERY "user_facing:" annotation independently — do not skip any.
+Chinese typographical errors / wrong characters (错别字) are HIGH
+   (e.g. 「做为」→「作为」, 「登陆」→「登录」 when login is meant).
 
 Rules:
 1) Primary focus: quoted string VALUES (user-facing text).
@@ -674,6 +677,31 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
 
             hints = extract_user_facing_hints(text, path_label)
+            if hints:
+                # Compact entry: avoid ±context windows that duplicate neighbors
+                # and drown the model in large batches.
+                assign = ASSIGNMENT_LINE_RE.match(text)
+                json_m = JSON_KV_RE.match(text.strip())
+                key_name = ""
+                if assign:
+                    key_name = assign.group(1)
+                elif json_m:
+                    key_name = json_m.group(1)
+                header = (
+                    f"# file: {path_label}\n"
+                    f"# line: {line_no}"
+                    + (f"\n# key: {key_name}" if key_name else "")
+                )
+                body = f"+{text}\n" + "\n".join(f"user_facing: {h}" for h in hints)
+                dedupe_key = f"{path_label}:{line_no}:{body}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                chunk = f"{header}\n{body}"
+                review_chunks.append(chunk)
+                review_by_file.setdefault(path_label, []).append(chunk)
+                continue
+
             start = max(0, idx - CONTEXT_LINES)
             end = min(len(lines), idx + CONTEXT_LINES + 1)
             window: list[str] = []
@@ -684,11 +712,9 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 if candidate.startswith("@@"):
                     continue
                 window.append(candidate)
-            if not window and not hints:
+            if not window:
                 continue
-            body = "\n".join(window) if window else f"+{text}"
-            if hints:
-                body = body + "\n" + "\n".join(f"user_facing: {h}" for h in hints)
+            body = "\n".join(window)
             dedupe_key = f"{path_label}:{line_no}:{body}"
             if dedupe_key in seen:
                 continue
