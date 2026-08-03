@@ -110,8 +110,7 @@ KNOWN_VALUE_TYPOS: tuple[tuple[str, str, str], ...] = (
 )
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
 _ID_PROBLEM_TOKENS = (
-    "identifier", "constant name", "key name", "object key", "property name",
-    "variable name", "key typo", "constant typo",
+    "identifier", "constant name", "key name", "object key", "property name", "variable name",
 )
 
 
@@ -125,29 +124,26 @@ Lines tagged `user_facing: ...` are highest priority.
 
 Rules:
 1) Focus on quoted VALUES. For value fixes, original/suggestion = value only, not whole KEY lines.
-2) IGNORE constant/key/identifier name typos (SCREAMING_SNAKE, camelCase, mixed-case keys like CONSOLE_lOG_*).
-   Never report them — only user-facing VALUES matter for this gate.
+2) Misspelled constant/key/identifier names (SCREAMING_SNAKE, camelCase): severity MUST be "low".
 3) IGNORE syntax/structure: commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
 4) Multiline KEY + value on next line is VALID — never flag "missing comma" on the key line; review the value.
 5) Placeholders {{...}}, %s/%d/%w, ${{...}}, Python {{}} must stay identical. NEVER suggest inventing
    or removing placeholders (e.g. do not add %d to "个物料模拟失败:").
 
-Ignore: imports, exports, URLs, paths, UUIDs, hashes, debug-only text, internal comments, identifier/key names.
+Ignore: imports, exports, URLs, paths, UUIDs, hashes, debug-only text, internal comments.
 
 Examples (good):
 - FILE_CAMERA_NOT_SELECT: 'File Camera not select' → original "File Camera not select",
   suggestion "File Camera not selected", severity "high"
 - Multiline KEY + value: review only the quoted string; do NOT flag key line syntax
-- cencel: 'Cencel' → report ONLY the value typo "Cencel"→"Cancel" (high); do NOT report the key
-
-Examples (DO NOT emit):
-- CONSOLE_lOG_SEARCH_SIGNAL / FLEX_LIGNT_CONTROL_TITLE key/identifier casing or spelling
+- FLEX_LIGNT_CONTROL_TITLE → identifier rename, severity "low"
+- cencel/Cencel → key typo (low) + value typo (high) as separate issues
 
 Casing: fix the word, not capitalization. "not Founded" → "not found" (NEVER suggest "Found").
 Chinese character typos in VALUES are HIGH (e.g. 己→已). Check every user_facing VALUE.
 
 Severity (lowercase): HIGH = spelling/grammar/wrong word in VALUES; MEDIUM = wording/readability;
-LOW = capitalization/style of VALUES only. Only "high" blocks merge.
+LOW = capitalization/style of VALUES + any identifier/key typos. Only "high" blocks merge.
 
 Return JSON ONLY (no fences). Schema:
 {{"has_issue": boolean, "issues": [{{"file": string, "line": number, "original": string,
@@ -266,10 +262,6 @@ def is_identifier_issue(issue: dict[str, Any]) -> bool:
         if any(w in problem for w in ("comma", "syntax", "colon")):
             return False
         return True
-    # Mixed-case SCREAMING_SNAKE glitch (e.g. CONSOLE_lOG_SEARCH_SIGNAL).
-    if re.match(rf"^{PROP_KEY}$", original) and "_" in original:
-        if any(c.islower() for c in original) and any(c.isupper() for c in original):
-            return True
     if looks_like_code_key(original) and looks_like_code_key(suggestion):
         o_key = original.rstrip().rstrip(",").rstrip(":")
         s_key = suggestion.rstrip().rstrip(",").rstrip(":")
@@ -311,13 +303,18 @@ def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
 
 
 def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Drop syntax FPs and identifier/key issues; keep only user-facing VALUE findings."""
     kept, dropped = [], []
     for issue in issues:
         normalized = normalize_issue_to_string_value(issue)
-        if is_syntax_false_positive(normalized) or is_identifier_issue(normalized):
+        if is_syntax_false_positive(normalized):
             dropped.append(issue)
             continue
+        if is_identifier_issue(normalized):
+            normalized["severity"] = SEVERITY_LOW
+            if not normalized.get("problem"):
+                normalized["problem"] = "Identifier / constant-name spelling"
+            elif "identifier" not in normalized["problem"].lower():
+                normalized["problem"] = f"Identifier / constant-name: {normalized['problem']}"
         normalized.pop("_invalid", None)
         normalized.pop("_kind", None)
         kept.append(normalized)
@@ -895,7 +892,7 @@ def postprocess_issues(
 ) -> list[dict[str, Any]]:
     issues = attach_locations(issues, added_details)
     kept, dropped = filter_userfacing_issues(issues)
-    _log_filtered(dropped, "syntax/identifier/non-localization issue(s)")
+    _log_filtered(dropped, "syntax/non-localization false positive(s)")
     kept, ph_dropped = filter_placeholder_mismatches(kept)
     if ph_dropped:
         _log_filtered(
@@ -910,6 +907,12 @@ def postprocess_issues(
         kept = merge_issues(kept, known)
         if len(kept) - before:
             print(f"Added {len(kept) - before} known typo issue(s) via deterministic safety net", file=sys.stderr)
+    id_low = sum(
+        1 for issue in kept
+        if issue["severity"] == SEVERITY_LOW and "identifier" in issue.get("problem", "").lower()
+    )
+    if id_low:
+        print(f"Downgraded {id_low} constant-name / identifier issue(s) to low", file=sys.stderr)
     return kept
 
 
