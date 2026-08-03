@@ -98,6 +98,7 @@ FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | r
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
+KEY_ASSIGN_PREFIX_RE = re.compile(rf"^({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
@@ -122,6 +123,13 @@ _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "(
 _ID_PROBLEM_TOKENS = (
     "identifier", "constant name", "key name", "object key", "property name",
     "variable name", "key typo",
+)
+_WS_PROBLEM_RE = re.compile(
+    r"leading\s+space|trailing\s+space|leading\s+whitespace|trailing\s+whitespace|"
+    r"extra\s+space|whitespace\s+at\s+(the\s+)?(start|beginning|end)|"
+    r"starts?\s+with\s+(a\s+)?space|ends?\s+with\s+(a\s+)?space|"
+    r"前导空格|尾随空格|首尾空格",
+    re.IGNORECASE,
 )
 _COMPLETE_FINISH_REASONS = frozenset({"STOP", "stop", "FINISH_REASON_STOP"})
 _ISSUE_SCHEMA: dict[str, Any] = {
@@ -162,7 +170,8 @@ When a line is annotated with "user_facing: ...", review that text first.
 Rules:
 1) Primary focus: quoted string VALUES (user-facing text).
    For value issues, "original" / "suggestion" MUST be ONLY the string value,
-   NOT the whole "KEY: 'value'" / 'KEY = "value"' line.
+   NOT the whole "KEY: 'value'" / 'KEY = "value"' line, and NOT a bare
+   "KEY =" / "KEY:" prefix.
 2) Constant / object-key / identifier names (e.g. FLEX_LIGNT_CONTROL_TITLE,
    cencel, dictionries): MAY be reported when misspelled, but severity MUST be
    "low" (never high/medium). These do NOT block merge.
@@ -175,6 +184,8 @@ Rules:
    fields MUST remain identical in suggestions. NEVER invent placeholders that
    are absent from original (e.g. do not turn "个物料模拟失败:" into
    "%d个物料模拟失败"). NEVER remove existing placeholders.
+6) Leading / trailing whitespace style in VALUES (e.g. intentional leading space
+   for layout) MAY be reported but severity MUST be "low" (never high/medium).
 
 Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
 messages, internal comments, vendor/framework glue.
@@ -215,11 +226,20 @@ Good examples:
     severity: "high"
   → Note placeholder %d is preserved unchanged.
 
+  Input (leading space — style only):
+    LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】导致图像LIMIT。"
+  → original: " {{}}【判定条件】导致图像LIMIT。"
+    suggestion: "{{}}【判定条件】导致图像LIMIT。"
+    severity: "low"
+  → DO NOT put "LIMIT_NORMAL_DEFECT_REASON =" into original.
+  → DO NOT mark leading/trailing whitespace as high.
+
 Bad examples (DO NOT emit):
   - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE: as "missing comma" because
     the string value is on the next line
   - Marking identifier/key typos as high/medium
-  - Putting "KEY: 'value'" into original for a value-only grammar fix
+  - Putting "KEY: 'value'" or bare "KEY =" into original for a value-only fix
+  - Marking leading/trailing whitespace as high/medium
 
 Casing / word-form rules (critical):
 - Fix the word itself; do NOT introduce incorrect capitalization.
@@ -236,9 +256,9 @@ Severity rules (severity values MUST be lowercase):
   seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
   incorrect word usage in VALUES MUST be "high".
 - MEDIUM: Wording / Readability / consistency improvements of VALUES
-- LOW: Capitalization / optional style of VALUES, AND any constant-name /
-  identifier / object-key spelling issues. Capitalization and identifier
-  issues MUST be "low".
+- LOW: Capitalization / optional style of VALUES (including leading/trailing
+  whitespace), AND any constant-name / identifier / object-key spelling issues.
+  Capitalization, whitespace-style, and identifier issues MUST be "low".
 
 Blocking rule: only "high" severity blocks merge.
 
@@ -331,8 +351,11 @@ def split_text_for_limit(text: str, limit: int) -> list[str]:
 
 
 def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
+    """Normalize KEY/value shapes. Preserve significant leading/trailing spaces in VALUES."""
     out = dict(issue)
-    original, suggestion = out.get("original", "").strip(), out.get("suggestion", "").strip()
+    original_raw = out.get("original", "")
+    suggestion_raw = out.get("suggestion", "")
+    original, suggestion = original_raw.strip(), suggestion_raw.strip()
     o_m, s_m = ASSIGNMENT_LINE_RE.match(original), ASSIGNMENT_LINE_RE.match(suggestion)
     if o_m and s_m:
         if o_m.group(1) != s_m.group(1):
@@ -342,6 +365,19 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
         return out
     if o_m and not s_m:
         out.update(original=o_m.group(3), _kind="value")
+        if suggestion_raw:
+            out["suggestion"] = suggestion_raw
+        return out
+    # Model sometimes emits bare "KEY =" / "KEY:" instead of the quoted VALUE.
+    if KEY_ASSIGN_PREFIX_RE.match(original):
+        out["_recover_original"] = True
+        out["_key_name"] = KEY_ASSIGN_PREFIX_RE.match(original).group(1)
+        if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion):
+            out["suggestion"] = suggestion_raw
+        return out
+    # Keep raw strings so intentional leading spaces are not stripped away.
+    out["original"] = original_raw
+    out["suggestion"] = suggestion_raw
     return out
 
 
@@ -372,6 +408,16 @@ def is_identifier_issue(issue: dict[str, Any]) -> bool:
     return False
 
 
+def is_whitespace_style_issue(issue: dict[str, Any]) -> bool:
+    """Leading/trailing whitespace style — informational low, never blocks."""
+    if _WS_PROBLEM_RE.search(issue.get("problem", "") or ""):
+        return True
+    original, suggestion = issue.get("original", ""), issue.get("suggestion", "")
+    if original and suggestion and original != suggestion and original.strip() == suggestion.strip():
+        return True
+    return False
+
+
 def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
     original = issue.get("original", "").strip()
     problem = issue.get("problem", "")
@@ -397,17 +443,80 @@ def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
     return False
 
 
+def _lookup_added_value(
+    added_details: dict[str, list[dict[str, Any]]],
+    path: str | None,
+    line: Any,
+    key_name: str | None = None,
+) -> tuple[str | None, int | None]:
+    paths = [path] if path in (added_details or {}) else list(added_details or {})
+    line_no = line if isinstance(line, int) else None
+    for p in paths:
+        rows = added_details.get(p) or []
+        if line_no and line_no > 0:
+            for row in rows:
+                if row.get("line") == line_no:
+                    hints = extract_user_facing_hints(row.get("text", ""), p or "")
+                    if hints:
+                        return hints[0], row.get("line")
+        if key_name:
+            for row in rows:
+                text = row.get("text", "")
+                if re.search(rf"\b{re.escape(key_name)}\b\s*[:=]", text):
+                    hints = extract_user_facing_hints(text, p or "")
+                    if hints:
+                        return hints[0], row.get("line")
+    return None, None
+
+
+def recover_key_prefix_originals(
+    issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Replace bare 'KEY =' originals with the quoted VALUE from the diff."""
+    recovered = []
+    for issue in issues:
+        out = dict(issue)
+        orig = (out.get("original") or "").strip()
+        need = out.pop("_recover_original", False) or bool(KEY_ASSIGN_PREFIX_RE.match(orig))
+        if not need:
+            recovered.append(out)
+            continue
+        key_name = out.pop("_key_name", None)
+        if not key_name and (m := KEY_ASSIGN_PREFIX_RE.match(orig)):
+            key_name = m.group(1)
+        value, found_line = _lookup_added_value(
+            added_details, out.get("file"), out.get("line"), key_name,
+        )
+        if value is not None:
+            out["original"] = value
+            if found_line and (not isinstance(out.get("line"), int) or out.get("line", -1) <= 0):
+                out["line"] = found_line
+            sugg = out.get("suggestion", "")
+            # If model only gave a stripped value, keep it; if suggestion is still a key prefix, fix.
+            if not sugg or KEY_ASSIGN_PREFIX_RE.match(sugg.strip()):
+                out["suggestion"] = value.lstrip() if value[:1].isspace() else value
+        recovered.append(out)
+    return recovered
+
+
 def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Drop syntax FPs; force key/identifier findings to low (informational only)."""
+    """Drop syntax FPs; force identifier / whitespace-style findings to low."""
     kept, dropped = [], []
     for issue in issues:
         normalized = normalize_issue_to_string_value(issue)
         if is_syntax_false_positive(normalized):
             dropped.append(issue)
             continue
-        if is_identifier_issue(normalized):
+        if KEY_ASSIGN_PREFIX_RE.match((normalized.get("original") or "").strip()):
+            # Bare "KEY =" that could not be recovered to a VALUE — drop.
+            dropped.append(issue)
+            continue
+        if is_identifier_issue(normalized) or is_whitespace_style_issue(normalized):
             normalized["severity"] = SEVERITY_LOW
+        normalized.pop("_invalid", None)
         normalized.pop("_kind", None)
+        normalized.pop("_recover_original", None)
+        normalized.pop("_key_name", None)
         kept.append(normalized)
     return kept, dropped
 
@@ -1102,6 +1211,10 @@ def postprocess_issues(
     issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     issues = attach_locations(issues, added_details)
+    issues = recover_key_prefix_originals(
+        [normalize_issue_to_string_value(i) for i in issues],
+        added_details,
+    )
     kept, dropped = filter_userfacing_issues(issues)
     _log_filtered(dropped, "syntax/non-localization false positive(s)")
     kept, ph_dropped = filter_placeholder_mismatches(kept)
