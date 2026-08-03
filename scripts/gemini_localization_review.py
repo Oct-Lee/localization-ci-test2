@@ -144,17 +144,125 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["has_issue", "issues"],
 }
-# Brief + 2 short examples; policy details live in code + responseSchema.
-_PROMPT_BRIEF = """Review user-facing string VALUES only (EN / zh-CN / pt-PT).
-Severity: spelling/grammar → high; wording → medium; value casing/style → low.
-Ignore syntax and key/identifier names. Keep placeholders unchanged.
-Examples:
-- good: original "File Camera not select" → suggestion "File Camera not selected" (high)
-- skip: key rename CONSOLE_lOG_* / FLEX_LIGNT_* (not a VALUE issue)"""
-
-
+# Full task brief + examples. Severity / FP enforcement also run in postprocess + responseSchema.
 def build_prompt(review_text: str) -> str:
-    return f"{_PROMPT_BRIEF}\n\n{review_text}\n"
+    return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
+
+Review ONLY user-facing string VALUES in the PR changes below
+(English / Simplified Chinese / Portuguese).
+
+Monorepo formats you will see:
+- JS/TS object:  auth_login: 'LOG IN'   |  title: 'ComX Config'
+- JS/TS multiline (VALID):  loading_license_check:\\n  'long text'
+- Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
+- JSON:  "confirm": "Confirm"
+- CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
+When a line is annotated with "user_facing: ...", review that text first.
+
+Rules:
+1) Primary focus: quoted string VALUES (user-facing text).
+   For value issues, "original" / "suggestion" MUST be ONLY the string value,
+   NOT the whole "KEY: 'value'" / 'KEY = "value"' line.
+2) Constant / object-key / identifier names (e.g. FLEX_LIGNT_CONTROL_TITLE,
+   cencel, dictionries): MAY be reported when misspelled, but severity MUST be
+   "low" (never high/medium). These do NOT block merge.
+3) MUST IGNORE code syntax / structure problems:
+   missing/extra commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
+4) Multiline key/value split is VALID. Never report "missing comma" / "incomplete
+   statement" just because the value is on the next line after "KEY_NAME:".
+   Review the following quoted value instead.
+5) Placeholders {{...}}, %s / %d / %w, ${{...}}, and Python {{}} / str.format
+   fields MUST remain identical in suggestions. NEVER invent placeholders that
+   are absent from original (e.g. do not turn "个物料模拟失败:" into
+   "%d个物料模拟失败"). NEVER remove existing placeholders.
+
+Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
+messages, internal comments, vendor/framework glue.
+
+Good examples:
+  Input: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
+  → original: "File Camera not select"
+    suggestion: "File Camera not selected"
+    severity: "high"
+
+  Input (multiline — valid):
+    COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE:
+      'Please save the changes to the Sequence first',
+  → review only: "Please save the changes to the Sequence first"
+  → DO NOT flag the key line as missing comma / incomplete syntax
+
+  Input: ERROR_CANNOT_FIND_CAMERA = "Cannot find camera {{}}. Pleace check..."
+  → original: "Cannot find camera {{}}. Pleace check..."
+    suggestion: "Cannot find camera {{}}. Please check..."
+    severity: "high"
+
+  Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
+  → original: "FLEX_LIGNT_CONTROL_TITLE"
+    suggestion: "FLEX_LIGHT_CONTROL_TITLE"
+    problem: "Identifier spelling: LIGNT → LIGHT"
+    severity: "low"
+
+  Input: cencel: 'Cencel',
+  → may emit TWO issues:
+      value: original "Cencel" → "Cancel" (high)
+      key: original "cencel" → "cancel" (low)
+
+  Input (Chinese typo with placeholder):
+    TRAINING_QUEUE_MSG: '已经加入训练序列，前面还有%d个神经网路'
+  → original: "已经加入训练序列，前面还有%d个神经网路"
+    suggestion: "已经加入训练序列，前面还有%d个神经网络"
+    problem: "Typo: 神经网路 should be 神经网络"
+    severity: "high"
+  → Note placeholder %d is preserved unchanged.
+
+Bad examples (DO NOT emit):
+  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE: as "missing comma" because
+    the string value is on the next line
+  - Marking identifier/key typos as high/medium
+  - Putting "KEY: 'value'" into original for a value-only grammar fix
+
+Casing / word-form rules (critical):
+- Fix the word itself; do NOT introduce incorrect capitalization.
+- Mid-sentence English words stay lowercase unless they are proper nouns or
+  the start of a sentence.
+- Example: "not Founded" → suggestion MUST be "not found"
+  (past participle of "find"). NEVER suggest "Found" or "not Found".
+- Example: "configration" → "configuration" (keep surrounding casing unchanged).
+- Use English comma "," in English sentences; do not keep Chinese "，" inside
+  English text when that is part of the error.
+
+Severity rules (severity values MUST be lowercase):
+- HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
+  seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
+  incorrect word usage in VALUES MUST be "high".
+- MEDIUM: Wording / Readability / consistency improvements of VALUES
+- LOW: Capitalization / optional style of VALUES, AND any constant-name /
+  identifier / object-key spelling issues. Capitalization and identifier
+  issues MUST be "low".
+
+Blocking rule: only "high" severity blocks merge.
+
+Return JSON ONLY. No markdown fences. No prose outside JSON.
+Schema:
+{{
+  "has_issue": boolean,
+  "issues": [
+    {{
+      "file": string,
+      "line": number,
+      "original": string,
+      "problem": string,
+      "suggestion": string,
+      "severity": "high" | "medium" | "low"
+    }}
+  ]
+}}
+If no issues: {{"has_issue": false, "issues": []}}
+If issues is non-empty, has_issue must be true.
+
+PR changes to review:
+{review_text}
+"""
 
 
 def should_skip_review_line(text: str) -> bool:
@@ -345,13 +453,21 @@ def _peek_multiline_string_value(
 def _peek_triple_quoted_string(
     lines: list[str], start_idx: int, quote: str, rest: str,
 ) -> tuple[list[int], str, int] | None:
-    """Parse KEY = \"\"\"...\"\"\" spanning one or more +diff lines."""
+    """Parse KEY = \"\"\"...\"\"\" spanning one or more +diff lines.
+
+    Returns (skip_indices, value, first_value_idx).
+    - skip_indices: +diff line indices AFTER start_idx that belong to this literal
+      (caller must not re-review them). start_idx is never included — the caller
+      already owns the opener line.
+    - One-liner KEY = \"\"\"value\"\"\" → skip=[], first_value_idx=start_idx.
+    """
     pieces: list[str] = []
     skip: list[int] = []
     first_value_idx = start_idx
     if rest:
-        if rest.endswith(quote):
-            return [], rest[: -len(quote)], start_idx
+        if quote in rest:
+            before, _, _after = rest.partition(quote)
+            return [], before, start_idx
         pieces.append(rest)
 
     for j in range(start_idx + 1, len(lines)):
@@ -369,8 +485,7 @@ def _peek_triple_quoted_string(
         if quote in text:
             before, _, _after = text.partition(quote)
             pieces.append(before)
-            value = "\n".join(pieces).rstrip("\n")
-            return skip, value, first_value_idx
+            return skip, "\n".join(pieces).rstrip("\n"), first_value_idx
         pieces.append(text)
     return None
 
@@ -690,9 +805,7 @@ def format_step_summary(
     *, status: str, issues: list[dict[str, Any]], duration_sec: float | None,
     usage: str = "N/A", extra_note: str = "",
     files: list[dict[str, Any]] | None = None, usage_stats: dict[str, Any] | None = None,
-    truncated: bool = False,  # retained for call-site compat; unused (no silent omit)
 ) -> str:
-    del truncated  # no truncation path; batches cover full text
     counts = count_by_severity(issues)
     duration = f"{duration_sec:.1f}s" if duration_sec is not None else "N/A"
     lines = [
