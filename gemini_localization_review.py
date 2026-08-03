@@ -21,11 +21,6 @@ from typing import Any, NamedTuple
 
 import requests
 
-# ---------------------------------------------------------------------------
-# Model failover / quotas
-# ---------------------------------------------------------------------------
-
-
 # Ordered failover chain. Quotas differ by model — pacing follows the active one.
 # Gemini 3 Flash API id is currently gemini-3-flash-preview.
 class GeminiModelQuota(NamedTuple):
@@ -43,9 +38,15 @@ GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
 )
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
+MODEL_ID = GEMINI_MODELS[0]  # primary; kept for docs/compat
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
-MAX_REVIEW_CHARS = 100_000  # 0803-proven batch size; pair with ±CONTEXT_LINES overlap for recall
+RETRYABLE_STATUS = {429, 500, 503}
+MAX_REVIEW_CHARS = 6_000  # ~6k: recall OK for dense ZH; 8k+/12k missed 神经网路
+# Primary-model defaults (compat for summary fields before any request).
+GEMINI_RPM_LIMIT = GEMINI_MODEL_QUOTAS[0].rpm
+GEMINI_TPM_LIMIT = GEMINI_MODEL_QUOTAS[0].tpm or 0
+GEMINI_RPD_LIMIT = GEMINI_MODEL_QUOTAS[0].rpd
 # RPM/TPM: wait ~1 min (or API "retry in Xs") and retry in the same workflow.
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 40  # up to ~40 minutes of quota waits per request
@@ -76,6 +77,10 @@ def min_request_interval_sec(rpm: int | None = None) -> float:
     """Leave slight headroom vs hard RPM (60/rpm + 0.1s)."""
     limit = active_model_quota().rpm if rpm is None else rpm
     return 60.0 / limit + 0.1
+
+
+# Compat alias: primary model interval.
+MIN_REQUEST_INTERVAL_SEC = min_request_interval_sec(GEMINI_RPM_LIMIT)
 
 
 def gemini_endpoint(model_id: str) -> str:
@@ -148,11 +153,6 @@ VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-# ---------------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------------
-
-
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 
@@ -165,7 +165,19 @@ Monorepo formats you will see:
 - Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
 - JSON:  "confirm": "Confirm"
 - CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
-When a line is annotated with "user_facing: ...", review that text first.
+When a line is annotated with "user_facing: ...", you MUST review that text.
+Check EVERY "user_facing:" annotation independently — do not skip any.
+
+EXHAUSTIVE OUTPUT (critical for flash-lite):
+- Your job is to LIST EVERY distinct VALUE issue you find — not a sample,
+  not the "top" issues, not only the worst ones.
+- NEVER stop after a few findings. If there are 20 bad VALUES, return 20 issues.
+- NEVER omit a clear typo/grammar error because another issue was already listed.
+- Prefer over-reporting borderline VALUE wording as "medium" rather than skipping.
+- Do NOT summarize multiple bad strings into one issue; one VALUE → one issue.
+
+Chinese typographical errors / wrong characters (错别字) are HIGH
+   (e.g. 「神经网路」→「神经网络」, 「做为」→「作为」, 「登陆」→「登录」 when login is meant).
 
 Rules:
 1) Primary focus: quoted string VALUES (user-facing text).
@@ -204,6 +216,15 @@ Good examples:
     suggestion: "Cannot find camera {{}}. Please check..."
     severity: "high"
 
+  Input: TRAIN_SCHEDULED = "已经加入训练序列，前面还有%d个神经网路"
+  → original: "已经加入训练序列，前面还有%d个神经网路"
+    suggestion: "已经加入训练序列，前面还有%d个神经网络"
+    severity: "high"
+
+  Input: "camera not Founded" / "parameter ofthe configrations file"
+  → each VALUE issue severity: "high"
+    ("Founded"→"found", "ofthe"→"of the", "configrations"→"configurations")
+
   Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
   → original: "FLEX_LIGNT_CONTROL_TITLE"
     suggestion: "FLEX_LIGHT_CONTROL_TITLE"
@@ -220,6 +241,9 @@ Bad examples (DO NOT emit):
     the string value is on the next line
   - Marking identifier/key typos as high/medium
   - Putting "KEY: 'value'" into original for a value-only grammar fix
+  - Returning only 2–3 issues when many user_facing VALUES are wrong
+  - Downgrading clear VALUE spelling/grammar (错别字, Founded, dose→does) to
+    medium/low — those MUST be "high"
 
 Casing / word-form rules (critical):
 - Fix the word itself; do NOT introduce incorrect capitalization.
@@ -234,8 +258,9 @@ Casing / word-form rules (critical):
 Severity rules (severity values MUST be lowercase):
 - HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
   seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
-  incorrect word usage in VALUES MUST be "high".
+  incorrect word usage / 错别字 in VALUES MUST be "high".
 - MEDIUM: Wording / Readability / consistency improvements of VALUES
+  (not clear typos).
 - LOW: Capitalization / optional style of VALUES, AND any constant-name /
   identifier / object-key spelling issues. Capitalization and identifier
   issues MUST be "low".
@@ -259,15 +284,11 @@ Schema:
 }}
 If no issues: {{"has_issue": false, "issues": []}}
 If issues is non-empty, has_issue must be true.
+Put EVERY finding in the "issues" array — do not truncate the list.
 
 PR changes to review:
 {review_text}
 """
-
-
-# ---------------------------------------------------------------------------
-# Diff parsing → review chunks
-# ---------------------------------------------------------------------------
 
 
 def should_skip_review_line(text: str) -> bool:
@@ -322,40 +343,6 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
 
 
 
-def _multiline_review_chunk(
-    path_label: str,
-    line_no: int,
-    user_facing_values: list[str],
-    *,
-    key_name: str | None = None,
-    note: str | None = None,
-    source_line: str | None = None,
-) -> str:
-    """Build a review chunk for JS KEY: / Python KEY = ( multiline values."""
-    parts = [f"# file: {path_label}", f"# line: {line_no}"]
-    if key_name:
-        parts.append(f"# key: {key_name}")
-    if note:
-        parts.append(f"# note: {note}")
-    if source_line is not None:
-        src = source_line if source_line.startswith("+") else f"+{source_line}"
-        parts.append(src)
-    for value in user_facing_values:
-        parts.append(f"user_facing: {value}")
-    return "\n".join(parts)
-
-
-def truncate_review_text(
-    review_text: str, limit: int | None = None
-) -> tuple[str, bool]:
-    """Return the first batch-sized prefix (legacy helper; prefer split_into_batches)."""
-    if limit is None:
-        limit = MAX_REVIEW_CHARS
-    if len(review_text) <= limit:
-        return review_text, False
-    return split_text_for_limit(review_text, limit)[0], True
-
-
 def split_text_for_limit(text: str, limit: int) -> list[str]:
     """Split ``text`` into pieces of at most ``limit`` chars without dropping content.
 
@@ -390,11 +377,6 @@ def split_text_for_limit(text: str, limit: int) -> list[str]:
         pieces.append(text[start:cut])
         start = cut
     return pieces
-
-
-# ---------------------------------------------------------------------------
-# Issue classification / filtering
-# ---------------------------------------------------------------------------
 
 
 def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
@@ -687,13 +669,14 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 )
                 key_name = (key_only or py_open).group(1)
                 opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                chunk = _multiline_review_chunk(
-                    path_label,
-                    value_line_no,
-                    [string_val],
-                    key_name=key_name,
-                    note="multiline KEY + string value (valid formatting)",
-                    source_line=f"+  {opener}\n+    {string_val!r}",
+                chunk = (
+                    f"# file: {path_label}\n"
+                    f"# line: {value_line_no}\n"
+                    f"# key: {key_name}\n"
+                    f"# note: multiline KEY + string value (valid formatting)\n"
+                    f"+  {opener}\n"
+                    f"+    {string_val!r}\n"
+                    f"user_facing: {string_val}"
                 )
                 dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
                 if dedupe_key not in seen:
@@ -710,8 +693,31 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
 
             hints = extract_user_facing_hints(text, path_label)
-            # Keep ±CONTEXT_LINES neighbors (same as 0803): redundant views of a
-            # typo across overlapping windows materially improve Chinese recall.
+            if hints:
+                # Compact entry: avoid ±context windows that duplicate neighbors
+                # and drown the model in large batches.
+                assign = ASSIGNMENT_LINE_RE.match(text)
+                json_m = JSON_KV_RE.match(text.strip())
+                key_name = ""
+                if assign:
+                    key_name = assign.group(1)
+                elif json_m:
+                    key_name = json_m.group(1)
+                header = (
+                    f"# file: {path_label}\n"
+                    f"# line: {line_no}"
+                    + (f"\n# key: {key_name}" if key_name else "")
+                )
+                body = f"+{text}\n" + "\n".join(f"user_facing: {h}" for h in hints)
+                dedupe_key = f"{path_label}:{line_no}:{body}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                chunk = f"{header}\n{body}"
+                review_chunks.append(chunk)
+                review_by_file.setdefault(path_label, []).append(chunk)
+                continue
+
             start = max(0, idx - CONTEXT_LINES)
             end = min(len(lines), idx + CONTEXT_LINES + 1)
             window: list[str] = []
@@ -722,20 +728,15 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 if candidate.startswith("@@"):
                     continue
                 window.append(candidate)
-            if not window and not hints:
+            if not window:
                 continue
-            body = "\n".join(window) if window else f"+{text}"
-            if hints:
-                body = (
-                    body
-                    + "\n"
-                    + "\n".join(f"user_facing: {h}" for h in hints)
-                )
+            body = "\n".join(window)
             dedupe_key = f"{path_label}:{line_no}:{body}"
             if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
-            chunk = f"# file: {path_label}\n# line: {line_no}\n{body}"
+            header = f"# file: {path_label}\n# line: {line_no}"
+            chunk = f"{header}\n{body}"
             review_chunks.append(chunk)
             review_by_file.setdefault(path_label, []).append(chunk)
             continue
@@ -773,7 +774,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
 
 
 def parse_diff(diff_text: str) -> str:
-    """Return compact review_text from a unified diff (wrapper over analyze_diff)."""
+    """Extract added lines with ±CONTEXT_LINES context for Gemini review."""
     return analyze_diff(diff_text)["review_text"]
 
 
@@ -793,25 +794,25 @@ def attach_locations(
     issues: list[dict[str, Any]],
     added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Fill / refine file/line by matching original text against added lines."""
+    """Fill missing file/line by matching original text against added lines."""
     enriched: list[dict[str, Any]] = []
     for issue in issues:
         out = dict(issue)
-        needle = (out.get("original") or "").strip()
-        if needle:
-            matched = False
-            for path, rows in added_details.items():
-                for row in rows:
-                    if needle in row["text"]:
-                        out["file"] = path
+        if out.get("file") and out.get("line") not in (None, -1):
+            enriched.append(out)
+            continue
+        needle = out.get("original", "")
+        matched = False
+        for path, rows in added_details.items():
+            for row in rows:
+                if needle and needle in row["text"]:
+                    out.setdefault("file", path)
+                    if out.get("line") in (None, -1):
                         out["line"] = row["line"]
-                        matched = True
-                        break
-                if matched:
+                    matched = True
                     break
-        elif not out.get("file") or out.get("line") in (None, -1):
-            # No needle; keep whatever the model provided.
-            pass
+            if matched:
+                break
         enriched.append(out)
     return enriched
 
@@ -848,32 +849,19 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("issues is non-empty but has_issue is not true")
 
     validated_issues: list[dict[str, Any]] = []
-    skipped = 0
     for i, issue in enumerate(issues):
         if not isinstance(issue, dict):
-            skipped += 1
-            print(f"Skipping issues[{i}]: not an object", file=sys.stderr)
-            continue
-        bad_field = None
+            raise ValueError(f"issues[{i}] must be an object")
         for field in ("original", "problem", "suggestion", "severity"):
             if field not in issue:
-                bad_field = f"missing {field}"
-                break
+                raise ValueError(f"issues[{i}] missing field: {field}")
             if not isinstance(issue[field], str) or not issue[field].strip():
-                bad_field = f"empty {field}"
-                break
-        if bad_field:
-            skipped += 1
-            print(f"Skipping issues[{i}]: {bad_field}", file=sys.stderr)
-            continue
+                raise ValueError(f"issues[{i}].{field} must be a non-empty string")
         severity = issue["severity"].strip().lower()
         if severity not in VALID_SEVERITIES:
-            skipped += 1
-            print(
-                f"Skipping issues[{i}]: invalid severity {issue['severity']!r}",
-                file=sys.stderr,
+            raise ValueError(
+                f"issues[{i}].severity must be one of {sorted(VALID_SEVERITIES)}"
             )
-            continue
         item: dict[str, Any] = {
             "original": issue["original"].strip(),
             "problem": issue["problem"].strip(),
@@ -882,25 +870,14 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         }
         if isinstance(issue.get("file"), str) and issue["file"].strip():
             item["file"] = issue["file"].strip()
-        if "line" in issue:
+        if "line" in issue and issue["line"] is not None:
             try:
                 item["line"] = int(issue["line"])
-            except (TypeError, ValueError):
-                item["line"] = -1
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"issues[{i}].line must be an integer") from exc
         validated_issues.append(item)
 
-    if skipped:
-        print(
-            f"Dropped {skipped} malformed issue(s) from model output",
-            file=sys.stderr,
-        )
-
-    # Reconcile has_issue with surviving issues.
-    has_issue = bool(validated_issues)
-    if payload["has_issue"] is False and validated_issues:
-        # Model inconsistency after drops; keep residual findings.
-        has_issue = True
-    return {"has_issue": has_issue, "issues": validated_issues}
+    return {"has_issue": bool(validated_issues), "issues": validated_issues}
 
 
 def parse_model_json(raw_text: str) -> dict[str, Any]:
@@ -935,9 +912,15 @@ def filter_placeholder_mismatches(
     return kept, dropped
 
 
-# ---------------------------------------------------------------------------
-# Reporting (stderr + GitHub Step Summary)
-# ---------------------------------------------------------------------------
+# Backward-compatible name used by older tests / callers.
+def check_placeholders(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept, dropped = filter_placeholder_mismatches(issues)
+    if dropped:
+        raise ValueError(
+            "Placeholder mismatch between original and suggestion: "
+            f"dropped={len(dropped)} example={dropped[0]}"
+        )
+    return kept
 
 
 def count_by_severity(issues: list[dict[str, str]]) -> dict[str, int]:
@@ -956,7 +939,6 @@ def format_step_summary(
     status: str,
     issues: list[dict[str, Any]],
     duration_sec: float | None,
-    truncated: bool,
     usage: str = "N/A",
     extra_note: str = "",
     files: list[dict[str, Any]] | None = None,
@@ -964,7 +946,6 @@ def format_step_summary(
 ) -> str:
     counts = count_by_severity(issues)
     duration = f"{duration_sec:.1f}s" if duration_sec is not None else "N/A"
-    omitted = (usage_stats or {}).get("chars_omitted", 0)
     lines = [
         "## Localization Quality Gate",
         "",
@@ -972,12 +953,24 @@ def format_step_summary(
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} "
         f"| Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Truncated: {'yes' if truncated else 'no'}"
-        + (f" (omitted {omitted} chars)" if omitted else ""),
         f"- Token usage: {usage}",
     ]
     if usage_stats:
-        models_s, limits_s = _models_and_limits_text(usage_stats, compact=False)
+        models = usage_stats.get("models_used") or []
+        models_s = ", ".join(models) if models else active_model_id()
+        model_limits = usage_stats.get("model_limits") or {}
+        if model_limits:
+            limits_s = "; ".join(
+                f"{mid} RPM={lim['rpm']}/RPD={lim['rpd']}"
+                + (f"/TPM={lim['tpm']}" if lim.get("tpm") else "")
+                for mid, lim in model_limits.items()
+            )
+        else:
+            limits_s = (
+                f"RPM={usage_stats['rpm_limit']} "
+                f"TPM={usage_stats['tpm_limit']} "
+                f"RPD={usage_stats['rpd_limit']}"
+            )
         lines.extend(
             [
                 f"- Models: {models_s}",
@@ -988,7 +981,6 @@ def format_step_summary(
                 f"candidates={usage_stats['candidates_tokens']} "
                 f"total={usage_stats['total_tokens']}",
                 f"- Review payload: sent={usage_stats['chars_sent']} chars, "
-                f"omitted={usage_stats['chars_omitted']} chars, "
                 f"batches={usage_stats['batches']}, "
                 f"files={usage_stats['files_reviewed']}",
             ]
@@ -1042,11 +1034,6 @@ def append_step_summary(markdown: str) -> None:
             handle.write("\n")
 
 
-# ---------------------------------------------------------------------------
-# Gemini API + usage accounting
-# ---------------------------------------------------------------------------
-
-
 def is_daily_quota_error(body: str) -> bool:
     """RPD / daily quota cannot be fixed by waiting ~1 minute."""
     return bool(DAILY_QUOTA_RE.search(body or ""))
@@ -1069,11 +1056,6 @@ def parse_retry_after_seconds(response: requests.Response) -> float:
     return QUOTA_RETRY_DEFAULT_SEC
 
 
-def _sleep_transient_backoff(attempt: int) -> None:
-    """Exponential backoff for timeout / 5xx (attempt is 1-based)."""
-    time.sleep(2 ** (attempt - 1))
-
-
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
     """Call Gemini; RPM/TPM 429 wait+retry; RPD fail over to next model."""
     body = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -1092,7 +1074,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                 raise RuntimeError(
                     f"Gemini API timeout after {MAX_ATTEMPTS} attempts"
                 ) from exc
-            _sleep_transient_backoff(transient_attempts)
+            time.sleep(2 ** (transient_attempts - 1))
             continue
         except requests.RequestException as exc:
             raise RuntimeError(f"Gemini API request failed: {exc}") from exc
@@ -1151,13 +1133,20 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                     f"Gemini API failed with HTTP {response.status_code}: "
                     f"{response.text[:1000]}"
                 )
-            _sleep_transient_backoff(transient_attempts)
+            time.sleep(2 ** (transient_attempts - 1))
             continue
 
         raise RuntimeError(
             f"Gemini API failed with HTTP {response.status_code}: "
             f"{response.text[:1000]}"
         )
+
+
+def extract_usage(api_payload: dict[str, Any]) -> str:
+    counts = extract_usage_counts(api_payload)
+    if not counts:
+        return "N/A"
+    return ", ".join(f"{k}={v}" for k, v in counts.items())
 
 
 def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
@@ -1183,7 +1172,6 @@ def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
 
 
 def empty_usage_stats() -> dict[str, Any]:
-    primary = GEMINI_MODEL_QUOTAS[0]
     return {
         "requests": 0,
         "prompt_tokens": 0,
@@ -1191,14 +1179,13 @@ def empty_usage_stats() -> dict[str, Any]:
         "total_tokens": 0,
         "batches": 0,
         "chars_sent": 0,
-        "chars_omitted": 0,
         "files_reviewed": 0,
         "models_used": [],
         "model_limits": {},
-        "rpm_limit": primary.rpm,
-        "tpm_limit": primary.tpm or 0,
-        "rpd_limit": primary.rpd,
-        "min_interval_sec": min_request_interval_sec(primary.rpm),
+        "rpm_limit": GEMINI_RPM_LIMIT,
+        "tpm_limit": GEMINI_TPM_LIMIT,
+        "rpd_limit": GEMINI_RPD_LIMIT,
+        "min_interval_sec": MIN_REQUEST_INTERVAL_SEC,
     }
 
 
@@ -1219,44 +1206,20 @@ def record_model_usage(stats: dict[str, Any], quota: GeminiModelQuota) -> None:
     stats["min_interval_sec"] = min_request_interval_sec(quota.rpm)
 
 
-def _models_and_limits_text(
-    stats: dict[str, Any], *, compact: bool = False
-) -> tuple[str, str]:
-    """Return (models_text, limits_text) for stderr / Step Summary."""
+def format_usage_summary(stats: dict[str, Any]) -> str:
     models = stats.get("models_used") or []
-    models_s = (
-        (",".join(models) if compact else ", ".join(models))
-        if models
-        else active_model_id()
-    )
+    models_s = ",".join(models) if models else active_model_id()
     model_limits = stats.get("model_limits") or {}
     if model_limits:
-        parts: list[str] = []
-        for mid, lim in model_limits.items():
-            if compact:
-                parts.append(f"{mid}:RPM={lim['rpm']}/RPD={lim['rpd']}")
-            else:
-                piece = f"{mid} RPM={lim['rpm']}/RPD={lim['rpd']}"
-                if lim.get("tpm"):
-                    piece += f"/TPM={lim['tpm']}"
-                parts.append(piece)
-        limits_s = (";" if compact else "; ").join(parts)
-    elif compact:
+        limits_s = ";".join(
+            f"{mid}:RPM={lim['rpm']}/RPD={lim['rpd']}"
+            for mid, lim in model_limits.items()
+        )
+    else:
         limits_s = (
             f"RPM={stats['rpm_limit']}/TPM={stats['tpm_limit']}/"
             f"RPD={stats['rpd_limit']}"
         )
-    else:
-        limits_s = (
-            f"RPM={stats['rpm_limit']} "
-            f"TPM={stats['tpm_limit']} "
-            f"RPD={stats['rpd_limit']}"
-        )
-    return models_s, limits_s
-
-
-def format_usage_summary(stats: dict[str, Any]) -> str:
-    models_s, limits_s = _models_and_limits_text(stats, compact=True)
     return (
         f"requests={stats['requests']} "
         f"(limits {limits_s}), "
@@ -1265,33 +1228,20 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
         f"candidates_tokens={stats['candidates_tokens']}, "
         f"total_tokens={stats['total_tokens']}, "
         f"chars_sent={stats['chars_sent']}, "
-        f"chars_omitted={stats['chars_omitted']}, "
         f"batches={stats['batches']}, "
         f"files={stats['files_reviewed']}, "
         f"pace>={stats['min_interval_sec']:.1f}s/req"
     )
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
 
 def split_into_batches(
-    review_text: str, limit: int | None = None
-) -> tuple[list[str], int]:
-    """Split one file's review text into API-sized batches.
-
-    Returns (batches, chars_omitted). Content is never omitted: oversized
-    regions are split on paragraph/line boundaries, then by hard char windows
-    so every character is still sent to Gemini across batches.
-    """
-    if limit is None:
-        limit = MAX_REVIEW_CHARS
+    review_text: str, limit: int = MAX_REVIEW_CHARS
+) -> list[str]:
+    """Split one file's review text into API-sized batches (no content dropped)."""
     if not review_text.strip():
-        return [], 0
-    batches = split_text_for_limit(review_text, limit)
-    return batches, 0
+        return []
+    return split_text_for_limit(review_text, limit)
 
 
 def postprocess_issues(
@@ -1300,19 +1250,25 @@ def postprocess_issues(
 ) -> list[dict[str, Any]]:
     """Attach locations, drop syntax FPs / bad placeholders, force identifier LOW."""
     issues = attach_locations(issues, added_details)
-
     kept, dropped = filter_userfacing_issues(issues)
-    _log_filtered(dropped, "syntax/non-localization false positive(s)")
-
+    if dropped:
+        print(
+            f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
+            file=sys.stderr,
+        )
     kept, ph_dropped = filter_placeholder_mismatches(kept)
     if ph_dropped:
-        _log_filtered(
-            ph_dropped,
-            "issue(s) with placeholder mismatch "
-            "(suggestion must not add/remove placeholders like %d / {id})",
-            show_samples=True,
+        print(
+            f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
+            f"(suggestion must not add/remove placeholders like %d / {{id}})",
+            file=sys.stderr,
         )
-
+        for bad in ph_dropped[:5]:
+            print(
+                f"  drop: original={bad.get('original')!r} "
+                f"suggestion={bad.get('suggestion')!r}",
+                file=sys.stderr,
+            )
     id_low = sum(
         1
         for issue in kept
@@ -1327,34 +1283,14 @@ def postprocess_issues(
     return kept
 
 
-def _log_filtered(
-    dropped: list[dict[str, Any]],
-    label: str,
-    *,
-    show_samples: bool = False,
-) -> None:
-    if not dropped:
-        return
-    print(f"Filtered {len(dropped)} {label}", file=sys.stderr)
-    if not show_samples:
-        return
-    for bad in dropped[:5]:
-        print(
-            f"  drop: original={bad.get('original')!r} "
-            f"suggestion={bad.get('suggestion')!r}",
-            file=sys.stderr,
-        )
-
-
 def review_by_file_sessions(
     api_key: str,
     review_by_file: dict[str, str],
-) -> tuple[list[dict[str, Any]], float, bool, dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     """One Gemini session per file (and per batch if a file is still too large).
 
     Requests are paced to the active model's RPM. Issues from all successful
-    batches are merged. Oversized files are split into full-coverage batches
-    (no content dropped).
+    batches are merged. Oversized files are split into full-coverage batches.
     """
     all_issues: list[dict[str, Any]] = []
     total_duration = 0.0
@@ -1364,14 +1300,12 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        batches, omitted = split_into_batches(text)
-        stats["chars_omitted"] += omitted
+        batches = split_into_batches(text)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
         print(
             f"Review session: {path} — {len(text)} chars, "
-            f"{len(batches)} batch(es)"
-            + (f", omitted {omitted} chars" if omitted else ""),
+            f"{len(batches)} batch(es)",
             file=sys.stderr,
         )
         for i, batch in enumerate(batches, 1):
@@ -1413,16 +1347,8 @@ def review_by_file_sessions(
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
 
-    truncated = stats["chars_omitted"] > 0
-    if truncated:
-        print(
-            f"WARNING: omitted {stats['chars_omitted']} chars of review text "
-            f"(should not happen; report a bug). Those lines were not sent "
-            f"to Gemini and issues there may be missing",
-            file=sys.stderr,
-        )
     print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
-    return all_issues, total_duration, truncated, stats
+    return all_issues, total_duration, stats
 
 
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1469,7 +1395,6 @@ def main(argv: list[str] | None = None) -> int:
             status="PASSED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="Out of path scope / empty diff — Gemini API not called",
             files=[],
         )
@@ -1492,7 +1417,6 @@ def main(argv: list[str] | None = None) -> int:
             status="PASSED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="No added lines — Gemini API not called",
             files=files,
         )
@@ -1506,7 +1430,6 @@ def main(argv: list[str] | None = None) -> int:
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="GEMINI_API_KEY is missing",
             files=files,
         )
@@ -1517,7 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        raw_issues, duration, truncated, usage_stats = review_by_file_sessions(
+        raw_issues, duration, usage_stats = review_by_file_sessions(
             api_key, review_by_file
         )
         kept = postprocess_issues(raw_issues, added_details)
@@ -1531,7 +1454,6 @@ def main(argv: list[str] | None = None) -> int:
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note=f"fail-closed: {exc}",
             files=files,
         )
@@ -1548,7 +1470,6 @@ def main(argv: list[str] | None = None) -> int:
         status=status,
         issues=kept,
         duration_sec=duration,
-        truncated=truncated,
         usage=usage,
         usage_stats=usage_stats,
         files=files,
