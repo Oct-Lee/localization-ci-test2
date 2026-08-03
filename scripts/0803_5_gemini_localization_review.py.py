@@ -152,45 +152,133 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["has_issue", "issues"],
 }
-# Compact task brief + critical examples. FP / severity also enforced in postprocess + responseSchema.
+# Full task brief + examples. Severity / FP enforcement also run in postprocess + responseSchema.
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
-Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
-Formats: JS/TS `KEY: 'value'` (multiline VALUE on next line is VALID); Python `KEY = "..."` /
-`KEY = (\\n  "..."\\n)`; JSON `"key": "value"`; CSV language cells (not the key column).
-Lines with `user_facing: ...` are highest priority.
+
+Review ONLY user-facing string VALUES in the PR changes below
+(English / Simplified Chinese / Portuguese).
+
+Monorepo formats you will see:
+- JS/TS object:  auth_login: 'LOG IN'   |  title: 'ComX Config'
+- JS/TS multiline (VALID):  loading_license_check:\\n  'long text'
+- Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
+- JSON:  "confirm": "Confirm"
+- CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
+When a line is annotated with "user_facing: ...", review that text first.
 
 Rules:
-1) `original` / `suggestion` = VALUE only — never whole `KEY: 'value'` / `KEY = "..."`, never bare `KEY =`.
-2) Identifier/key typos (e.g. FLEX_LIGNT_*, cencel) → severity `low` only (never blocks).
-3) Ignore syntax/structure: commas, colons, braces, key-line "missing comma" on multiline splits.
-4) Keep placeholders identical (`{{...}}`, `%s`/`%d`, `${{...}}`). NEVER invent or remove them.
-5) Leading/trailing whitespace style → `low` only.
+1) Primary focus: quoted string VALUES (user-facing text).
+   For value issues, "original" / "suggestion" MUST be ONLY the string value,
+   NOT the whole "KEY: 'value'" / 'KEY = "value"' line, and NOT a bare
+   "KEY =" / "KEY:" prefix.
+2) Constant / object-key / identifier names (e.g. FLEX_LIGNT_CONTROL_TITLE,
+   cencel, dictionries): MAY be reported when misspelled, but severity MUST be
+   "low" (never high/medium). These do NOT block merge.
+3) MUST IGNORE code syntax / structure problems:
+   missing/extra commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
+4) Multiline key/value split is VALID. Never report "missing comma" / "incomplete
+   statement" just because the value is on the next line after "KEY_NAME:".
+   Review the following quoted value instead.
+5) Placeholders {{...}}, %s / %d / %w, ${{...}}, and Python {{}} / str.format
+   fields MUST remain identical in suggestions. NEVER invent placeholders that
+   are absent from original (e.g. do not turn "个物料模拟失败:" into
+   "%d个物料模拟失败"). NEVER remove existing placeholders.
+6) Leading / trailing whitespace style in VALUES (e.g. intentional leading space
+   for layout) MAY be reported but severity MUST be "low" (never high/medium).
 
-Ignore: imports, URLs, paths, UUIDs, hashes, debug text, internal comments.
+Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
+messages, internal comments, vendor/framework glue.
 
-Examples:
-- `FILE_CAMERA_NOT_SELECT: 'File Camera not select'` → original "File Camera not select",
-  suggestion "File Camera not selected", high
-- Multiline `KEY:\\n  'Please save...'` → review the quoted VALUE only; do not flag key-line syntax
-- `ERROR_X = "Cannot find camera {{}}. Pleace check..."` → fix "Pleace"→"Please", keep `{{}}`, high
-- `FLEX_LIGNT_CONTROL_TITLE: 'Brightness control'` → key "FLEX_LIGNT_*"→"FLEX_LIGHT_*", low
-- `cencel: 'Cencel'` → value "Cencel"→"Cancel" (high); key "cencel"→"cancel" (low)
-- `...%d个神经网路` → `...%d个神经网络` (high; keep `%d`)
-- `LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】..."` → original includes leading space VALUE,
-  whitespace trim is low — never put `LIMIT_NORMAL_DEFECT_REASON =` in original
+Good examples:
+  Input: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
+  → original: "File Camera not select"
+    suggestion: "File Camera not selected"
+    severity: "high"
 
-Casing: fix the word, not capitalization. "not Founded" → "not found" (never "Found").
-Keep surrounding casing for fixes like "configration"→"configuration".
-English text should use "," not Chinese "，" when that is the error.
+  Input (multiline — valid):
+    COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE:
+      'Please save the changes to the Sequence first',
+  → review only: "Please save the changes to the Sequence first"
+  → DO NOT flag the key line as missing comma / incomplete syntax
 
-Severity (lowercase): high = spelling/grammar/wrong word in VALUES; medium = wording;
-low = VALUE casing/style/whitespace, and any identifier/key issues. Only high blocks merge.
+  Input: ERROR_CANNOT_FIND_CAMERA = "Cannot find camera {{}}. Pleace check..."
+  → original: "Cannot find camera {{}}. Pleace check..."
+    suggestion: "Cannot find camera {{}}. Please check..."
+    severity: "high"
 
-Return JSON only (schema enforced by API):
-{{"has_issue": bool, "issues": [{{"file","line","original","problem","suggestion",
-"severity":"high"|"medium"|"low"}}]}}
-Empty → {{"has_issue": false, "issues": []}}. Non-empty issues ⇒ has_issue true.
+  Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
+  → original: "FLEX_LIGNT_CONTROL_TITLE"
+    suggestion: "FLEX_LIGHT_CONTROL_TITLE"
+    problem: "Identifier spelling: LIGNT → LIGHT"
+    severity: "low"
+
+  Input: cencel: 'Cencel',
+  → may emit TWO issues:
+      value: original "Cencel" → "Cancel" (high)
+      key: original "cencel" → "cancel" (low)
+
+  Input (Chinese typo with placeholder):
+    TRAINING_QUEUE_MSG: '已经加入训练序列，前面还有%d个神经网路'
+  → original: "已经加入训练序列，前面还有%d个神经网路"
+    suggestion: "已经加入训练序列，前面还有%d个神经网络"
+    problem: "Typo: 神经网路 should be 神经网络"
+    severity: "high"
+  → Note placeholder %d is preserved unchanged.
+
+  Input (leading space — style only):
+    LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】导致图像LIMIT。"
+  → original: " {{}}【判定条件】导致图像LIMIT。"
+    suggestion: "{{}}【判定条件】导致图像LIMIT。"
+    severity: "low"
+  → DO NOT put "LIMIT_NORMAL_DEFECT_REASON =" into original.
+  → DO NOT mark leading/trailing whitespace as high.
+
+Bad examples (DO NOT emit):
+  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE: as "missing comma" because
+    the string value is on the next line
+  - Marking identifier/key typos as high/medium
+  - Putting "KEY: 'value'" or bare "KEY =" into original for a value-only fix
+  - Marking leading/trailing whitespace as high/medium
+
+Casing / word-form rules (critical):
+- Fix the word itself; do NOT introduce incorrect capitalization.
+- Mid-sentence English words stay lowercase unless they are proper nouns or
+  the start of a sentence.
+- Example: "not Founded" → suggestion MUST be "not found"
+  (past participle of "find"). NEVER suggest "Found" or "not Found".
+- Example: "configration" → "configuration" (keep surrounding casing unchanged).
+- Use English comma "," in English sentences; do not keep Chinese "，" inside
+  English text when that is part of the error.
+
+Severity rules (severity values MUST be lowercase):
+- HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
+  seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
+  incorrect word usage in VALUES MUST be "high".
+- MEDIUM: Wording / Readability / consistency improvements of VALUES
+- LOW: Capitalization / optional style of VALUES (including leading/trailing
+  whitespace), AND any constant-name / identifier / object-key spelling issues.
+  Capitalization, whitespace-style, and identifier issues MUST be "low".
+
+Blocking rule: only "high" severity blocks merge.
+
+Return JSON ONLY. No markdown fences. No prose outside JSON.
+Schema:
+{{
+  "has_issue": boolean,
+  "issues": [
+    {{
+      "file": string,
+      "line": number,
+      "original": string,
+      "problem": string,
+      "suggestion": string,
+      "severity": "high" | "medium" | "low"
+    }}
+  ]
+}}
+If no issues: {{"has_issue": false, "issues": []}}
+If issues is non-empty, has_issue must be true.
 
 PR changes to review:
 {review_text}
