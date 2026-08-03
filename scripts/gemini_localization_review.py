@@ -93,7 +93,7 @@ def pace_after_model_failover() -> None:
 
 
 CONTEXT_LINES = 3
-PLACEHOLDER_RE = re.compile(r"\{[^}]+\}|%\w|\$\{[^}]+\}")
+PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|%\w|\$\{[^}]*\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
@@ -118,6 +118,7 @@ SYNTAX_PROBLEM_RE = re.compile(
 )
 SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW = "high", "medium", "low"
 VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
+_SEVERITY_RANK = {SEVERITY_HIGH: 3, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
 _ID_PROBLEM_TOKENS = (
@@ -152,45 +153,36 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["has_issue", "issues"],
 }
-# Compact task brief + critical examples. FP / severity also enforced in postprocess + responseSchema.
+
+
+# Task brief + key examples. Severity/FP also enforced in postprocess + responseSchema.
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
-Formats: JS/TS `KEY: 'value'` (multiline VALUE on next line is VALID); Python `KEY = "..."` /
-`KEY = (\\n  "..."\\n)`; JSON `"key": "value"`; CSV language cells (not the key column).
-Lines with `user_facing: ...` are highest priority.
+Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
+Prefer lines tagged user_facing:.
 
 Rules:
-1) `original` / `suggestion` = VALUE only — never whole `KEY: 'value'` / `KEY = "..."`, never bare `KEY =`.
-2) Identifier/key typos (e.g. FLEX_LIGNT_*, cencel) → severity `low` only (never blocks).
-3) Ignore syntax/structure: commas, colons, braces, key-line "missing comma" on multiline splits.
-4) Keep placeholders identical (`{{...}}`, `%s`/`%d`, `${{...}}`). NEVER invent or remove them.
-5) Leading/trailing whitespace style → `low` only.
-
-Ignore: imports, URLs, paths, UUIDs, hashes, debug text, internal comments.
+1) original/suggestion = VALUE only — never whole KEY lines or bare "KEY =" / "KEY:".
+2) Identifier/key typos (e.g. FLEX_LIGNT_*) MAY be reported at severity "low" only.
+3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
+4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
+5) Leading/trailing whitespace style → severity "low" only (never high/medium).
+Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
 
 Examples:
-- `FILE_CAMERA_NOT_SELECT: 'File Camera not select'` → original "File Camera not select",
-  suggestion "File Camera not selected", high
-- Multiline `KEY:\\n  'Please save...'` → review the quoted VALUE only; do not flag key-line syntax
-- `ERROR_X = "Cannot find camera {{}}. Pleace check..."` → fix "Pleace"→"Please", keep `{{}}`, high
-- `FLEX_LIGNT_CONTROL_TITLE: 'Brightness control'` → key "FLEX_LIGNT_*"→"FLEX_LIGHT_*", low
-- `cencel: 'Cencel'` → value "Cencel"→"Cancel" (high); key "cencel"→"cancel" (low)
-- `...%d个神经网路` → `...%d个神经网络` (high; keep `%d`)
-- `LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】..."` → original includes leading space VALUE,
-  whitespace trim is low — never put `LIMIT_NORMAL_DEFECT_REASON =` in original
+- FILE_CAMERA_NOT_SELECT: 'File Camera not select'
+  → original "File Camera not select", suggestion "File Camera not selected", high
+- "not Founded" → "not found" (high). Never suggest "Found".
+- TRAINING_QUEUE_MSG: '...%d个神经网路' → '...%d个神经网络' (keep %d; high)
+- FLEX_LIGNT_CONTROL_TITLE: '...' → key rename only, severity low
+- LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】..."
+  → original with leading space; whitespace style → low (not "LIMIT_... =")
 
-Casing: fix the word, not capitalization. "not Founded" → "not found" (never "Found").
-Keep surrounding casing for fixes like "configration"→"configuration".
-English text should use "," not Chinese "，" when that is the error.
+Severity (lowercase): high = VALUE spelling/grammar/wrong word; medium = wording;
+low = VALUE casing/whitespace style OR identifier/key typos. Only high blocks merge.
 
-Severity (lowercase): high = spelling/grammar/wrong word in VALUES; medium = wording;
-low = VALUE casing/style/whitespace, and any identifier/key issues. Only high blocks merge.
-
-Return JSON only (schema enforced by API):
-{{"has_issue": bool, "issues": [{{"file","line","original","problem","suggestion",
-"severity":"high"|"medium"|"low"}}]}}
-Empty → {{"has_issue": false, "issues": []}}. Non-empty issues ⇒ has_issue true.
+Return JSON only (schema enforced by API). Empty → {{"has_issue": false, "issues": []}}.
 
 PR changes to review:
 {review_text}
@@ -281,9 +273,9 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
             out["suggestion"] = suggestion_raw
         return out
     # Model sometimes emits bare "KEY =" / "KEY:" instead of the quoted VALUE.
-    if KEY_ASSIGN_PREFIX_RE.match(original):
+    if m := KEY_ASSIGN_PREFIX_RE.match(original):
         out["_recover_original"] = True
-        out["_key_name"] = KEY_ASSIGN_PREFIX_RE.match(original).group(1)
+        out["_key_name"] = m.group(1)
         if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion):
             out["suggestion"] = suggestion_raw
         return out
@@ -411,11 +403,13 @@ def recover_key_prefix_originals(
     return recovered
 
 
-def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def filter_userfacing_issues(
+    issues: list[dict[str, Any]], *, already_normalized: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Drop syntax FPs; force identifier / whitespace-style findings to low."""
     kept, dropped = [], []
     for issue in issues:
-        normalized = normalize_issue_to_string_value(issue)
+        normalized = issue if already_normalized else normalize_issue_to_string_value(issue)
         if is_syntax_false_positive(normalized):
             dropped.append(issue)
             continue
@@ -425,7 +419,6 @@ def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[st
             continue
         if is_identifier_issue(normalized) or is_whitespace_style_issue(normalized):
             normalized["severity"] = SEVERITY_LOW
-        normalized.pop("_invalid", None)
         normalized.pop("_kind", None)
         normalized.pop("_recover_original", None)
         normalized.pop("_key_name", None)
@@ -670,7 +663,8 @@ def attach_locations(
     enriched = []
     for issue in issues:
         out = dict(issue)
-        needle = (out.get("original") or "").strip()
+        raw = out.get("original") or ""
+        needle = raw.strip()
         if not needle:
             enriched.append(out)
             continue
@@ -683,7 +677,8 @@ def attach_locations(
             for row in added_details.get(path, []):
                 text = row["text"]
                 hit = (path, row["line"])
-                if _value_exact_in_line(needle, text):
+                # Prefer exact VALUE match including intentional leading spaces.
+                if _value_exact_in_line(raw, text) or _value_exact_in_line(needle, text):
                     exact.append(hit)
                 elif f'"{needle}"' in text or f"'{needle}'" in text:
                     soft.append(hit)
@@ -698,7 +693,9 @@ def attach_locations(
 
 def strip_markdown_fence(text: str) -> str:
     stripped = text.strip()
-    return FENCE_RE.match(stripped).group(1).strip() if FENCE_RE.match(stripped) else stripped
+    if m := FENCE_RE.match(stripped):
+        return m.group(1).strip()
+    return stripped
 
 
 def extract_response_text(api_payload: dict[str, Any]) -> str:
@@ -755,10 +752,12 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         if severity not in VALID_SEVERITIES:
             skipped_reasons.append(f"issues[{i}]: invalid severity {issue['severity']!r}")
             continue
+        # Preserve VALUE whitespace (leading/trailing spaces may be intentional).
+        # Only trim problem text; emptiness already validated via .strip() above.
         item: dict[str, Any] = {
-            "original": issue["original"].strip(),
+            "original": issue["original"],
             "problem": issue["problem"].strip(),
-            "suggestion": issue["suggestion"].strip(),
+            "suggestion": issue["suggestion"],
             "severity": severity,
         }
         if isinstance(issue.get("file"), str) and issue["file"].strip():
@@ -916,13 +915,14 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             "responseSchema": RESPONSE_SCHEMA,
         },
     }
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     start = time.monotonic()
     quota_retries = transient_attempts = 0
     while True:
         model_id = active_model_id()
-        url = f"{gemini_endpoint(model_id)}?key={api_key}"
+        url = gemini_endpoint(model_id)
         try:
-            response = requests.post(url, json=body, timeout=HTTP_TIMEOUT_SEC)
+            response = requests.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT_SEC)
         except requests.Timeout as exc:
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
@@ -1119,15 +1119,34 @@ def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bo
             )
 
 
+def dedupe_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse overlap/batch duplicates; keep the highest severity per finding."""
+    best: dict[tuple[Any, ...], dict[str, Any]] = {}
+    order: list[tuple[Any, ...]] = []
+    for issue in issues:
+        key = (
+            issue.get("file"),
+            issue.get("line"),
+            issue.get("original"),
+            issue.get("suggestion"),
+        )
+        prev = best.get(key)
+        if prev is None:
+            best[key] = issue
+            order.append(key)
+            continue
+        if _SEVERITY_RANK.get(issue.get("severity"), 0) > _SEVERITY_RANK.get(prev.get("severity"), 0):
+            best[key] = issue
+    return [best[k] for k in order]
+
+
 def postprocess_issues(
     issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     issues = attach_locations(issues, added_details)
-    issues = recover_key_prefix_originals(
-        [normalize_issue_to_string_value(i) for i in issues],
-        added_details,
-    )
-    kept, dropped = filter_userfacing_issues(issues)
+    normalized = [normalize_issue_to_string_value(i) for i in issues]
+    recovered = recover_key_prefix_originals(normalized, added_details)
+    kept, dropped = filter_userfacing_issues(recovered, already_normalized=True)
     _log_filtered(dropped, "syntax/non-localization false positive(s)")
     kept, ph_dropped = filter_placeholder_mismatches(kept)
     if ph_dropped:
@@ -1137,6 +1156,10 @@ def postprocess_issues(
             "(suggestion must not add/remove placeholders like %d / {id})",
             show_samples=True,
         )
+    before = len(kept)
+    kept = dedupe_issues(kept)
+    if len(kept) < before:
+        print(f"Deduped {before - len(kept)} duplicate issue(s)", file=sys.stderr)
     return kept
 
 
