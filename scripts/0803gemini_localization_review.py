@@ -27,26 +27,26 @@ class GeminiModelQuota(NamedTuple):
     model_id: str
     rpm: int
     rpd: int
-    tpm: int = 250_000
+    tpm: int | None = None  # None = not relied on for pacing
 
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500),
-    GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500),
-    GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20),
-    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20),
-    GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20),
+    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
+    GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
 )
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
-GEMINI_API_BASE = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-)
-MAX_REVIEW_CHARS = 100_000
-# Prefer smaller batches so the model does not miss mid-file value issues
-# on large translation files (still never omits content).
-PREFERRED_BATCH_CHARS = 12_000
+MODEL_ID = GEMINI_MODELS[0]  # primary; kept for docs/compat
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
+RETRYABLE_STATUS = {429, 500, 503}
+MAX_REVIEW_CHARS = 100_000
+# Primary-model defaults (compat for summary fields before any request).
+GEMINI_RPM_LIMIT = GEMINI_MODEL_QUOTAS[0].rpm
+GEMINI_TPM_LIMIT = GEMINI_MODEL_QUOTAS[0].tpm or 0
+GEMINI_RPD_LIMIT = GEMINI_MODEL_QUOTAS[0].rpd
 # RPM/TPM: wait ~1 min (or API "retry in Xs") and retry in the same workflow.
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 40  # up to ~40 minutes of quota waits per request
@@ -79,6 +79,17 @@ def min_request_interval_sec(rpm: int | None = None) -> float:
     return 60.0 / limit + 0.1
 
 
+# Compat alias: primary model interval.
+MIN_REQUEST_INTERVAL_SEC = min_request_interval_sec(GEMINI_RPM_LIMIT)
+
+
+def gemini_endpoint(model_id: str) -> str:
+    return (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent"
+    )
+
+
 def try_advance_model(reason: str) -> bool:
     """Switch to the next Gemini model; return False if none left."""
     global _active_model_index
@@ -108,7 +119,6 @@ IDENTIFIER_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
-PY_PAREN_CLOSE_RE = re.compile(r"^\s*\)\s*,?\s*$")
 STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])(.*)\1\s*,?\s*$""")
 ASSIGNMENT_LINE_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""",
@@ -308,7 +318,7 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
 
 
 def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tuple[str, bool]:
-    """Take the first <=limit slice, preferring a ``\\n\\n`` cut near the end."""
+    """Truncate on chunk boundaries when possible to avoid mid-entry cuts."""
     if len(review_text) <= limit:
         return review_text, False
     truncated = review_text[:limit]
@@ -316,42 +326,6 @@ def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tup
     if cut > limit // 2:
         truncated = truncated[:cut]
     return truncated, True
-
-
-def split_oversized_chunk(text: str, limit: int) -> list[str]:
-    """Hard-split text into pieces each <= limit without dropping content.
-
-    Prefers ``\\n\\n`` then ``\\n`` near the end of each window; otherwise cuts
-    at ``limit``. Every character of ``text`` appears in exactly one piece
-    (aside from skipped separator newlines between pieces).
-    """
-    if not text:
-        return []
-    if len(text) <= limit:
-        return [text]
-
-    pieces: list[str] = []
-    start = 0
-    n = len(text)
-    while start < n:
-        remaining = n - start
-        if remaining <= limit:
-            pieces.append(text[start:])
-            break
-        window = text[start : start + limit]
-        cut_rel = window.rfind("\n\n")
-        if cut_rel <= limit // 2:
-            cut_rel = window.rfind("\n")
-        if cut_rel <= limit // 2:
-            cut_rel = limit
-        end = start + cut_rel
-        if end <= start:
-            end = start + limit
-        pieces.append(text[start:end])
-        start = end
-        while start < n and text[start] == "\n":
-            start += 1
-    return pieces
 
 
 def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
@@ -514,50 +488,27 @@ def _new_file_entry(path: str) -> dict[str, Any]:
 
 
 def _peek_multiline_string_value(
-    lines: list[str],
-    start_idx: int,
-    *,
-    join_python_concat: bool = False,
-    max_look_ahead: int = 40,
-) -> tuple[list[int], str] | None:
-    """Collect quoted value line(s) after a multiline KEY opener.
-
-    For JS/TS ``KEY:`` — first quoted line only.
-    For Python ``KEY = (`` — join adjacent implicit-concat string literals
-    until ``)``, so the full sentence is reviewed as one value.
-    Returns (diff_line_indices, joined_inner_text) or None.
-    """
-    indices: list[int] = []
-    parts: list[str] = []
-    end = min(len(lines), start_idx + 1 + max_look_ahead)
-    for j in range(start_idx + 1, end):
+    lines: list[str], start_idx: int
+) -> tuple[int, str] | None:
+    """If next added line is a quoted value for a multiline KEY:, return (idx, text)."""
+    for j in range(start_idx + 1, min(len(lines), start_idx + 6)):
         candidate = lines[j]
         if candidate.startswith("---") or candidate.startswith("+++"):
-            break
+            return None
         if candidate.startswith("@@"):
-            break
+            return None
         if candidate.startswith("-"):
             continue
+        if candidate.startswith("+"):
+            value_text = candidate[1:]
+            if STRING_VALUE_LINE_RE.match(value_text):
+                return j, value_text
+            return None
         if candidate.startswith(" "):
             # Unchanged context between key and value — still allow.
             continue
-        if not candidate.startswith("+"):
-            break
-        value_text = candidate[1:]
-        if PY_PAREN_CLOSE_RE.match(value_text):
-            break
-        string_m = STRING_VALUE_LINE_RE.match(value_text)
-        if string_m:
-            indices.append(j)
-            parts.append(string_m.group(2))
-            if not join_python_concat:
-                break
-            continue
-        # Non-string content after KEY opener.
-        break
-    if not parts:
         return None
-    return indices, "".join(parts)
+    return None
 
 
 def analyze_diff(diff_text: str) -> dict[str, Any]:
@@ -581,22 +532,18 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             files_order.append(path)
         return files_map[path]
 
-    def set_current_file(path: str) -> None:
-        nonlocal current_file, new_line_no
-        current_file = path
-        ensure_file(path)
-        new_line_no = None
-
     for idx, line in enumerate(lines):
         if line.startswith("+++ b/"):
-            set_current_file(line[6:])
+            current_file = line[6:]
+            ensure_file(current_file)
+            new_line_no = None
             continue
         if line.startswith("+++ "):
             rest = line[4:]
             if rest.startswith("b/"):
-                set_current_file(rest[2:])
-            else:
-                new_line_no = None
+                current_file = rest[2:]
+                ensure_file(current_file)
+            new_line_no = None
             continue
 
         hunk = HUNK_RE.match(line)
@@ -618,37 +565,28 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
 
             path_label = current_file or "(unknown)"
 
-            # JS/TS multiline KEY: + value, or Python KEY = ( + "a" "b" ... )
+            # JS/TS multiline KEY: + value, or Python KEY = ( + "value"
             key_only = KEY_ONLY_LINE_RE.match(text)
             py_open = PY_KEY_OPEN_RE.match(text)
             merged_value = None
             if key_only or py_open:
-                merged_value = _peek_multiline_string_value(
-                    lines,
-                    idx,
-                    join_python_concat=bool(py_open),
-                )
+                merged_value = _peek_multiline_string_value(lines, idx)
 
             if (key_only or py_open) and merged_value:
-                value_indices, string_val = merged_value
-                for value_idx in value_indices:
-                    skip_indices.add(value_idx)
+                value_idx, value_text = merged_value
+                skip_indices.add(value_idx)
                 value_line_no = line_no + 1 if line_no >= 0 else -1
                 key_name = (key_only or py_open).group(1)
+                string_m = STRING_VALUE_LINE_RE.match(value_text)
+                string_val = string_m.group(2) if string_m else value_text.strip()
                 opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                note = (
-                    "multiline Python KEY = ( implicit string concat "
-                    "(valid formatting)"
-                    if py_open
-                    else "multiline KEY + string value (valid formatting)"
-                )
                 chunk = (
                     f"# file: {path_label}\n"
                     f"# line: {value_line_no}\n"
                     f"# key: {key_name}\n"
-                    f"# note: {note}\n"
+                    f"# note: multiline KEY + string value (valid formatting)\n"
                     f"+  {opener}\n"
-                    f'+    "{string_val}"\n'
+                    f"+    {value_text.strip()}\n"
                     f"user_facing: {string_val}"
                 )
                 dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
@@ -658,7 +596,7 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                     review_by_file.setdefault(path_label, []).append(chunk)
                 continue
 
-            # Bare key / KEY = ( without visible value yet — wait for value line(s).
+            # Bare key / KEY = ( without visible value yet — wait for value line.
             if key_only or py_open:
                 continue
 
@@ -710,11 +648,9 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             }
         )
 
-    review_by_file_text = OrderedDict(
-        (path, "\n\n".join(chunks))
-        for path, chunks in review_by_file.items()
-        if chunks
-    )
+    review_by_file_text = {
+        path: "\n\n".join(chunks) for path, chunks in review_by_file.items() if chunks
+    }
     return {
         "review_text": "\n\n".join(review_chunks),
         "review_by_file": review_by_file_text,
@@ -848,24 +784,31 @@ def placeholders(text: str) -> set[str]:
 def filter_placeholder_mismatches(
     issues: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Drop issues whose suggestion invents placeholders absent from original.
+    """Drop issues where suggestion adds/removes/changes placeholders.
 
-    Removing or reforming existing placeholders still keeps the issue so
-    real spelling/grammar fixes (e.g. 神经网路 → 神经网络 with %d kept or
-    accidentally dropped) are not silenced. Inventing new tokens like '%d'
-    when original had none remains filtered.
+    Bad model suggestions (e.g. inventing '%d') must not fail the whole gate.
     """
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     for issue in issues:
         original_ph = placeholders(issue["original"])
         suggestion_ph = placeholders(issue["suggestion"])
-        invented = suggestion_ph - original_ph
-        if invented:
+        if original_ph != suggestion_ph:
             dropped.append(issue)
             continue
         kept.append(issue)
     return kept, dropped
+
+
+# Backward-compatible name used by older tests / callers.
+def check_placeholders(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept, dropped = filter_placeholder_mismatches(issues)
+    if dropped:
+        raise ValueError(
+            "Placeholder mismatch between original and suggestion: "
+            f"dropped={len(dropped)} example={dropped[0]}"
+        )
+    return kept
 
 
 def count_by_severity(issues: list[dict[str, str]]) -> dict[str, int]:
@@ -907,12 +850,25 @@ def format_step_summary(
     if usage_stats:
         models = usage_stats.get("models_used") or []
         models_s = ", ".join(models) if models else active_model_id()
+        model_limits = usage_stats.get("model_limits") or {}
+        if model_limits:
+            limits_s = "; ".join(
+                f"{mid} RPM={lim['rpm']}/RPD={lim['rpd']}"
+                + (f"/TPM={lim['tpm']}" if lim.get("tpm") else "")
+                for mid, lim in model_limits.items()
+            )
+        else:
+            limits_s = (
+                f"RPM={usage_stats['rpm_limit']} "
+                f"TPM={usage_stats['tpm_limit']} "
+                f"RPD={usage_stats['rpd_limit']}"
+            )
         lines.extend(
             [
                 f"- Models: {models_s}",
                 f"- API requests: {usage_stats['requests']} "
                 f"(paced ≥{usage_stats['min_interval_sec']:.1f}s; "
-                f"limits {format_model_limits(usage_stats, sep='; ', with_tpm=True)})",
+                f"limits {limits_s})",
                 f"- Tokens: prompt={usage_stats['prompt_tokens']} "
                 f"candidates={usage_stats['candidates_tokens']} "
                 f"total={usage_stats['total_tokens']}",
@@ -971,6 +927,11 @@ def append_step_summary(markdown: str) -> None:
             handle.write("\n")
 
 
+def is_daily_quota_error(body: str) -> bool:
+    """RPD / daily quota cannot be fixed by waiting ~1 minute."""
+    return bool(DAILY_QUOTA_RE.search(body or ""))
+
+
 def parse_retry_after_seconds(response: requests.Response) -> float:
     """Prefer API 'retry in Xs', then Retry-After header, else 60s."""
     header = response.headers.get("Retry-After") or response.headers.get("retry-after")
@@ -988,10 +949,6 @@ def parse_retry_after_seconds(response: requests.Response) -> float:
     return QUOTA_RETRY_DEFAULT_SEC
 
 
-def _transient_backoff(attempt: int) -> None:
-    time.sleep(2 ** (attempt - 1))
-
-
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
     """Call Gemini; RPM/TPM 429 wait+retry; RPD fail over to next model."""
     body = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -1001,7 +958,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
 
     while True:
         model_id = active_model_id()
-        url = f"{GEMINI_API_BASE}/{model_id}:generateContent?key={api_key}"
+        url = f"{gemini_endpoint(model_id)}?key={api_key}"
         try:
             response = requests.post(url, json=body, timeout=HTTP_TIMEOUT_SEC)
         except requests.Timeout as exc:
@@ -1010,7 +967,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                 raise RuntimeError(
                     f"Gemini API timeout after {MAX_ATTEMPTS} attempts"
                 ) from exc
-            _transient_backoff(transient_attempts)
+            time.sleep(2 ** (transient_attempts - 1))
             continue
         except requests.RequestException as exc:
             raise RuntimeError(f"Gemini API request failed: {exc}") from exc
@@ -1026,7 +983,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
 
         if response.status_code == 429:
             text = response.text or ""
-            if DAILY_QUOTA_RE.search(text):
+            if is_daily_quota_error(text):
                 if try_advance_model(
                     f"RPD/daily quota exhausted on {model_id}"
                 ):
@@ -1069,13 +1026,20 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                     f"Gemini API failed with HTTP {response.status_code}: "
                     f"{response.text[:1000]}"
                 )
-            _transient_backoff(transient_attempts)
+            time.sleep(2 ** (transient_attempts - 1))
             continue
 
         raise RuntimeError(
             f"Gemini API failed with HTTP {response.status_code}: "
             f"{response.text[:1000]}"
         )
+
+
+def extract_usage(api_payload: dict[str, Any]) -> str:
+    counts = extract_usage_counts(api_payload)
+    if not counts:
+        return "N/A"
+    return ", ".join(f"{k}={v}" for k, v in counts.items())
 
 
 def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
@@ -1101,7 +1065,6 @@ def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
 
 
 def empty_usage_stats() -> dict[str, Any]:
-    primary = GEMINI_MODEL_QUOTAS[0]
     return {
         "requests": 0,
         "prompt_tokens": 0,
@@ -1113,7 +1076,10 @@ def empty_usage_stats() -> dict[str, Any]:
         "files_reviewed": 0,
         "models_used": [],
         "model_limits": {},
-        "min_interval_sec": min_request_interval_sec(primary.rpm),
+        "rpm_limit": GEMINI_RPM_LIMIT,
+        "tpm_limit": GEMINI_TPM_LIMIT,
+        "rpd_limit": GEMINI_RPD_LIMIT,
+        "min_interval_sec": MIN_REQUEST_INTERVAL_SEC,
     }
 
 
@@ -1121,44 +1087,36 @@ def record_model_usage(stats: dict[str, Any], quota: GeminiModelQuota) -> None:
     mid = quota.model_id
     if mid not in stats["models_used"]:
         stats["models_used"].append(mid)
-    interval = min_request_interval_sec(quota.rpm)
     stats["model_limits"][mid] = {
         "rpm": quota.rpm,
         "rpd": quota.rpd,
         "tpm": quota.tpm,
-        "min_interval_sec": interval,
+        "min_interval_sec": min_request_interval_sec(quota.rpm),
     }
-    stats["min_interval_sec"] = interval
-
-
-def format_model_limits(
-    stats: dict[str, Any],
-    *,
-    sep: str = ";",
-    with_tpm: bool = False,
-) -> str:
-    model_limits = stats.get("model_limits") or {}
-    if model_limits:
-        parts: list[str] = []
-        for mid, lim in model_limits.items():
-            piece = f"{mid}:RPM={lim['rpm']}/RPD={lim['rpd']}"
-            if with_tpm and lim.get("tpm") is not None:
-                piece += f"/TPM={lim['tpm']}"
-            parts.append(piece)
-        return sep.join(parts)
-    q = active_model_quota()
-    base = f"RPM={q.rpm}/RPD={q.rpd}"
-    if with_tpm:
-        base += f"/TPM={q.tpm}"
-    return base
+    # Summary fields track the model used most recently (pacing source).
+    stats["rpm_limit"] = quota.rpm
+    stats["rpd_limit"] = quota.rpd
+    stats["tpm_limit"] = quota.tpm or 0
+    stats["min_interval_sec"] = min_request_interval_sec(quota.rpm)
 
 
 def format_usage_summary(stats: dict[str, Any]) -> str:
     models = stats.get("models_used") or []
     models_s = ",".join(models) if models else active_model_id()
+    model_limits = stats.get("model_limits") or {}
+    if model_limits:
+        limits_s = ";".join(
+            f"{mid}:RPM={lim['rpm']}/RPD={lim['rpd']}"
+            for mid, lim in model_limits.items()
+        )
+    else:
+        limits_s = (
+            f"RPM={stats['rpm_limit']}/TPM={stats['tpm_limit']}/"
+            f"RPD={stats['rpd_limit']}"
+        )
     return (
         f"requests={stats['requests']} "
-        f"(limits {format_model_limits(stats)}), "
+        f"(limits {limits_s}), "
         f"models={models_s}, "
         f"prompt_tokens={stats['prompt_tokens']}, "
         f"candidates_tokens={stats['candidates_tokens']}, "
@@ -1173,34 +1131,35 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
 
 
 def split_into_batches(
-    review_text: str, limit: int = PREFERRED_BATCH_CHARS
-) -> list[str]:
+    review_text: str, limit: int = MAX_REVIEW_CHARS
+) -> tuple[list[str], int]:
     """Split one file's review text into API-sized batches on chunk boundaries.
 
-    Default ``limit`` is PREFERRED_BATCH_CHARS for better model recall on large
-    translation files. Oversized single chunks are hard-split so **all** content
-    is reviewed (nothing is omitted). Hard pieces never exceed MAX_REVIEW_CHARS.
+    Returns (batches, chars_omitted). Content is only omitted when a single
+    chunk exceeds ``limit`` and must be truncated.
     """
     if not review_text.strip():
-        return []
-    hard_limit = min(limit, MAX_REVIEW_CHARS)
-    if len(review_text) <= hard_limit:
-        return [review_text]
+        return [], 0
+    if len(review_text) <= limit:
+        return [review_text], 0
 
     parts = review_text.split("\n\n")
     batches: list[str] = []
     current: list[str] = []
     current_len = 0
+    omitted = 0
     for part in parts:
         part_len = len(part)
-        if part_len > hard_limit:
+        if part_len > limit:
             if current:
                 batches.append("\n\n".join(current))
                 current, current_len = [], 0
-            batches.extend(split_oversized_chunk(part, hard_limit))
+            truncated, _ = truncate_review_text(part, limit)
+            omitted += max(0, part_len - len(truncated))
+            batches.append(truncated)
             continue
         sep = 2 if current else 0
-        if current and current_len + sep + part_len > hard_limit:
+        if current and current_len + sep + part_len > limit:
             batches.append("\n\n".join(current))
             current = [part]
             current_len = part_len
@@ -1209,25 +1168,7 @@ def split_into_batches(
             current_len += sep + part_len
     if current:
         batches.append("\n\n".join(current))
-    return batches
-
-
-def _log_filter(
-    label: str,
-    dropped: list[dict[str, Any]],
-    *,
-    examples: bool = False,
-) -> None:
-    if not dropped:
-        return
-    print(f"Filtered {len(dropped)} {label}", file=sys.stderr)
-    if examples:
-        for bad in dropped[:5]:
-            print(
-                f"  drop: original={bad.get('original')!r} "
-                f"suggestion={bad.get('suggestion')!r}",
-                file=sys.stderr,
-            )
+    return batches, omitted
 
 
 def postprocess_issues(
@@ -1235,17 +1176,26 @@ def postprocess_issues(
     added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """Attach locations, drop syntax FPs / bad placeholders, force identifier LOW."""
-    kept, dropped = filter_userfacing_issues(
-        attach_locations(issues, added_details)
-    )
-    _log_filter("syntax/non-localization false positive(s)", dropped)
+    issues = attach_locations(issues, added_details)
+    kept, dropped = filter_userfacing_issues(issues)
+    if dropped:
+        print(
+            f"Filtered {len(dropped)} syntax/non-localization false positive(s)",
+            file=sys.stderr,
+        )
     kept, ph_dropped = filter_placeholder_mismatches(kept)
-    _log_filter(
-        "issue(s) that invent placeholders "
-        "(suggestion must not add placeholders absent from original)",
-        ph_dropped,
-        examples=True,
-    )
+    if ph_dropped:
+        print(
+            f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
+            f"(suggestion must not add/remove placeholders like %d / {{id}})",
+            file=sys.stderr,
+        )
+        for bad in ph_dropped[:5]:
+            print(
+                f"  drop: original={bad.get('original')!r} "
+                f"suggestion={bad.get('suggestion')!r}",
+                file=sys.stderr,
+            )
     id_low = sum(
         1
         for issue in kept
@@ -1267,8 +1217,8 @@ def review_by_file_sessions(
     """One Gemini session per file (and per batch if a file is still too large).
 
     Requests are paced to the active model's RPM. Issues from all successful
-    batches are merged. Oversized content is hard-split into further batches
-    so nothing is dropped from review.
+    batches are merged. Content is only omitted when a single entry exceeds
+    MAX_REVIEW_CHARS (logged via chars_omitted).
     """
     all_issues: list[dict[str, Any]] = []
     total_duration = 0.0
@@ -1278,26 +1228,24 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        batches = split_into_batches(text)
-        # Guarantee every piece is within the API char budget without omission.
-        expanded: list[str] = []
-        for batch in batches:
-            if len(batch) > MAX_REVIEW_CHARS:
-                expanded.extend(split_oversized_chunk(batch, MAX_REVIEW_CHARS))
-            else:
-                expanded.append(batch)
-        batches = expanded
+        batches, omitted = split_into_batches(text)
+        stats["chars_omitted"] += omitted
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
         print(
             f"Review session: {path} — {len(text)} chars, "
-            f"{len(batches)} batch(es)",
+            f"{len(batches)} batch(es)"
+            + (f", omitted {omitted} chars" if omitted else ""),
             file=sys.stderr,
         )
-        for i, piece in enumerate(batches, 1):
+        for i, batch in enumerate(batches, 1):
+            if len(batch) > MAX_REVIEW_CHARS:
+                before = len(batch)
+                batch, _ = truncate_review_text(batch)
+                stats["chars_omitted"] += before - len(batch)
             if len(batches) > 1:
                 print(
-                    f"  batch {i}/{len(batches)}: {len(piece)} chars",
+                    f"  batch {i}/{len(batches)}: {len(batch)} chars",
                     file=sys.stderr,
                 )
 
@@ -1314,13 +1262,13 @@ def review_by_file_sessions(
                     )
                     time.sleep(wait)
 
-            prompt = build_prompt(piece)
+            prompt = build_prompt(batch)
             api_payload, duration = call_gemini(api_key, prompt)
             last_request_at = time.monotonic()
             total_duration += duration
             stats["requests"] += 1
             record_model_usage(stats, active_model_quota())
-            stats["chars_sent"] += len(piece)
+            stats["chars_sent"] += len(batch)
             counts = extract_usage_counts(api_payload)
             stats["prompt_tokens"] += counts.get("prompt", 0)
             stats["candidates_tokens"] += counts.get("candidates", 0)
@@ -1333,9 +1281,16 @@ def review_by_file_sessions(
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
 
+    truncated = stats["chars_omitted"] > 0
+    if truncated:
+        print(
+            f"WARNING: omitted {stats['chars_omitted']} chars of review text "
+            f"(single entry > {MAX_REVIEW_CHARS}); those lines were not sent "
+            f"to Gemini and issues there may be missing",
+            file=sys.stderr,
+        )
     print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
-    # truncated always False: oversized text is split, never dropped.
-    return all_issues, total_duration, False, stats
+    return all_issues, total_duration, truncated, stats
 
 
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1345,27 +1300,6 @@ def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
 def print_result_json(result: dict[str, Any]) -> None:
     """Stdout contract: validated JSON matching the gate schema (+ files)."""
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-def pass_without_api(
-    *,
-    files: list[dict[str, Any]],
-    note: str,
-    stderr_message: str,
-) -> int:
-    print(stderr_message, file=sys.stderr)
-    append_step_summary(
-        format_step_summary(
-            status="PASSED",
-            issues=[],
-            duration_sec=None,
-            truncated=False,
-            extra_note=note,
-            files=files,
-        )
-    )
-    print_result_json(empty_result(files))
-    return 0
 
 
 def fail(
@@ -1395,13 +1329,21 @@ def main(argv: list[str] | None = None) -> int:
         return fail(f"Failed to read diff file: {exc}")
 
     if not diff_text.strip():
-        return pass_without_api(
-            files=[],
-            note="Out of path scope / empty diff — Gemini API not called",
-            stderr_message=(
-                "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API"
-            ),
+        print(
+            "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API",
+            file=sys.stderr,
         )
+        summary = format_step_summary(
+            status="PASSED",
+            issues=[],
+            duration_sec=None,
+            truncated=False,
+            extra_note="Out of path scope / empty diff — Gemini API not called",
+            files=[],
+        )
+        append_step_summary(summary)
+        print_result_json(empty_result())
+        return 0
 
     analyzed = analyze_diff(diff_text)
     files = analyzed["files"]
@@ -1410,13 +1352,21 @@ def main(argv: list[str] | None = None) -> int:
     print_files_report(files)
 
     if not any(text.strip() for text in review_by_file.values()):
-        return pass_without_api(
-            files=files,
-            note="No added lines — Gemini API not called",
-            stderr_message=(
-                "No added lines to review under scoped diff — skip Gemini API"
-            ),
+        print(
+            "No added lines to review under scoped diff — skip Gemini API",
+            file=sys.stderr,
         )
+        summary = format_step_summary(
+            status="PASSED",
+            issues=[],
+            duration_sec=None,
+            truncated=False,
+            extra_note="No added lines — Gemini API not called",
+            files=files,
+        )
+        append_step_summary(summary)
+        print_result_json(empty_result(files))
+        return 0
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -1478,6 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Blocking HIGH severity issues found", file=sys.stderr)
         return 1
     return 0
+
 
 
 if __name__ == "__main__":
