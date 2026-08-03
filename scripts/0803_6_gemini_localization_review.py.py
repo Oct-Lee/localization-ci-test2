@@ -165,7 +165,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
-# Task brief. Severity/FP also enforced in postprocess + responseSchema.
+# Task brief + key examples. Severity/FP also enforced in postprocess + responseSchema.
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
@@ -174,13 +174,22 @@ Prefer lines tagged user_facing:.
 
 Rules:
 1) original/suggestion = VALUE only — never whole KEY lines or bare "KEY =" / "KEY:".
-2) Identifier/key typos MAY be reported at severity "low" only.
+2) Identifier/key typos (e.g. FLEX_LIGNT_*) MAY be reported at severity "low" only.
 3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
 4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
 5) Leading/trailing whitespace style → severity "low" only (never high/medium).
-6) Inspect EVERY user_facing VALUE carefully (character-level spelling/grammar/wrong words,
-   including CJK near-miss characters). Do not skip tagged lines.
+6) Inspect EVERY user_facing VALUE carefully (character-level). Catch CJK near-misses
+   (网路→网络), missing/extra Latin letters, wrong words — do not skip any tagged line.
 Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
+
+Examples:
+- FILE_CAMERA_NOT_SELECT: 'File Camera not select'
+  → original "File Camera not select", suggestion "File Camera not selected", high
+- "not Founded" → "not found" (high). Never suggest "Found".
+- TRAINING_QUEUE_MSG: '...%d个神经网路' → '...%d个神经网络' (keep %d; high)
+- FLEX_LIGNT_CONTROL_TITLE: '...' → key rename only, severity low
+- LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】..."
+  → original with leading space; whitespace style → low (not "LIMIT_... =")
 
 Severity (lowercase): high = VALUE spelling/grammar/wrong word; medium = wording;
 low = VALUE casing/whitespace style OR identifier/key typos. Only high blocks merge.
