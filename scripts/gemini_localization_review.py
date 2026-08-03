@@ -42,7 +42,7 @@ MODEL_ID = GEMINI_MODELS[0]  # primary; kept for docs/compat
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 RETRYABLE_STATUS = {429, 500, 503}
-MAX_REVIEW_CHARS = 4_000  # smaller batches = better typo recall on dense i18n files
+MAX_REVIEW_CHARS = 6_000  # ~6k: recall OK for dense ZH; 8k+/12k missed 神经网路
 # Primary-model defaults (compat for summary fields before any request).
 GEMINI_RPM_LIMIT = GEMINI_MODEL_QUOTAS[0].rpm
 GEMINI_TPM_LIMIT = GEMINI_MODEL_QUOTAS[0].tpm or 0
@@ -167,8 +167,17 @@ Monorepo formats you will see:
 - CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
 When a line is annotated with "user_facing: ...", you MUST review that text.
 Check EVERY "user_facing:" annotation independently — do not skip any.
+
+EXHAUSTIVE OUTPUT (critical for flash-lite):
+- Your job is to LIST EVERY distinct VALUE issue you find — not a sample,
+  not the "top" issues, not only the worst ones.
+- NEVER stop after a few findings. If there are 20 bad VALUES, return 20 issues.
+- NEVER omit a clear typo/grammar error because another issue was already listed.
+- Prefer over-reporting borderline VALUE wording as "medium" rather than skipping.
+- Do NOT summarize multiple bad strings into one issue; one VALUE → one issue.
+
 Chinese typographical errors / wrong characters (错别字) are HIGH
-   (e.g. 「做为」→「作为」, 「登陆」→「登录」 when login is meant).
+   (e.g. 「神经网路」→「神经网络」, 「做为」→「作为」, 「登陆」→「登录」 when login is meant).
 
 Rules:
 1) Primary focus: quoted string VALUES (user-facing text).
@@ -207,6 +216,15 @@ Good examples:
     suggestion: "Cannot find camera {{}}. Please check..."
     severity: "high"
 
+  Input: TRAIN_SCHEDULED = "已经加入训练序列，前面还有%d个神经网路"
+  → original: "已经加入训练序列，前面还有%d个神经网路"
+    suggestion: "已经加入训练序列，前面还有%d个神经网络"
+    severity: "high"
+
+  Input: "camera not Founded" / "parameter ofthe configrations file"
+  → each VALUE issue severity: "high"
+    ("Founded"→"found", "ofthe"→"of the", "configrations"→"configurations")
+
   Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
   → original: "FLEX_LIGNT_CONTROL_TITLE"
     suggestion: "FLEX_LIGHT_CONTROL_TITLE"
@@ -223,6 +241,9 @@ Bad examples (DO NOT emit):
     the string value is on the next line
   - Marking identifier/key typos as high/medium
   - Putting "KEY: 'value'" into original for a value-only grammar fix
+  - Returning only 2–3 issues when many user_facing VALUES are wrong
+  - Downgrading clear VALUE spelling/grammar (错别字, Founded, dose→does) to
+    medium/low — those MUST be "high"
 
 Casing / word-form rules (critical):
 - Fix the word itself; do NOT introduce incorrect capitalization.
@@ -237,8 +258,9 @@ Casing / word-form rules (critical):
 Severity rules (severity values MUST be lowercase):
 - HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
   seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
-  incorrect word usage in VALUES MUST be "high".
+  incorrect word usage / 错别字 in VALUES MUST be "high".
 - MEDIUM: Wording / Readability / consistency improvements of VALUES
+  (not clear typos).
 - LOW: Capitalization / optional style of VALUES, AND any constant-name /
   identifier / object-key spelling issues. Capitalization and identifier
   issues MUST be "low".
@@ -262,6 +284,7 @@ Schema:
 }}
 If no issues: {{"has_issue": false, "issues": []}}
 If issues is non-empty, has_issue must be true.
+Put EVERY finding in the "issues" array — do not truncate the list.
 
 PR changes to review:
 {review_text}
@@ -318,13 +341,6 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
 
     return []
 
-
-
-def truncate_review_text(review_text: str, limit: int = MAX_REVIEW_CHARS) -> tuple[str, bool]:
-    """Return the first batch-sized prefix (legacy helper; prefer split_into_batches)."""
-    if len(review_text) <= limit:
-        return review_text, False
-    return split_text_for_limit(review_text, limit)[0], True
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -923,7 +939,6 @@ def format_step_summary(
     status: str,
     issues: list[dict[str, Any]],
     duration_sec: float | None,
-    truncated: bool,
     usage: str = "N/A",
     extra_note: str = "",
     files: list[dict[str, Any]] | None = None,
@@ -931,7 +946,6 @@ def format_step_summary(
 ) -> str:
     counts = count_by_severity(issues)
     duration = f"{duration_sec:.1f}s" if duration_sec is not None else "N/A"
-    omitted = (usage_stats or {}).get("chars_omitted", 0)
     lines = [
         "## Localization Quality Gate",
         "",
@@ -939,8 +953,6 @@ def format_step_summary(
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} "
         f"| Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Truncated: {'yes' if truncated else 'no'}"
-        + (f" (omitted {omitted} chars)" if omitted else ""),
         f"- Token usage: {usage}",
     ]
     if usage_stats:
@@ -969,7 +981,6 @@ def format_step_summary(
                 f"candidates={usage_stats['candidates_tokens']} "
                 f"total={usage_stats['total_tokens']}",
                 f"- Review payload: sent={usage_stats['chars_sent']} chars, "
-                f"omitted={usage_stats['chars_omitted']} chars, "
                 f"batches={usage_stats['batches']}, "
                 f"files={usage_stats['files_reviewed']}",
             ]
@@ -1168,7 +1179,6 @@ def empty_usage_stats() -> dict[str, Any]:
         "total_tokens": 0,
         "batches": 0,
         "chars_sent": 0,
-        "chars_omitted": 0,
         "files_reviewed": 0,
         "models_used": [],
         "model_limits": {},
@@ -1218,7 +1228,6 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
         f"candidates_tokens={stats['candidates_tokens']}, "
         f"total_tokens={stats['total_tokens']}, "
         f"chars_sent={stats['chars_sent']}, "
-        f"chars_omitted={stats['chars_omitted']}, "
         f"batches={stats['batches']}, "
         f"files={stats['files_reviewed']}, "
         f"pace>={stats['min_interval_sec']:.1f}s/req"
@@ -1228,17 +1237,11 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
 
 def split_into_batches(
     review_text: str, limit: int = MAX_REVIEW_CHARS
-) -> tuple[list[str], int]:
-    """Split one file's review text into API-sized batches.
-
-    Returns (batches, chars_omitted). Content is never omitted: oversized
-    regions are split on paragraph/line boundaries, then by hard char windows
-    so every character is still sent to Gemini across batches.
-    """
+) -> list[str]:
+    """Split one file's review text into API-sized batches (no content dropped)."""
     if not review_text.strip():
-        return [], 0
-    batches = split_text_for_limit(review_text, limit)
-    return batches, 0
+        return []
+    return split_text_for_limit(review_text, limit)
 
 
 def postprocess_issues(
@@ -1283,12 +1286,11 @@ def postprocess_issues(
 def review_by_file_sessions(
     api_key: str,
     review_by_file: dict[str, str],
-) -> tuple[list[dict[str, Any]], float, bool, dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     """One Gemini session per file (and per batch if a file is still too large).
 
     Requests are paced to the active model's RPM. Issues from all successful
-    batches are merged. Oversized files are split into full-coverage batches
-    (no content dropped).
+    batches are merged. Oversized files are split into full-coverage batches.
     """
     all_issues: list[dict[str, Any]] = []
     total_duration = 0.0
@@ -1298,14 +1300,12 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        batches, omitted = split_into_batches(text)
-        stats["chars_omitted"] += omitted
+        batches = split_into_batches(text)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
         print(
             f"Review session: {path} — {len(text)} chars, "
-            f"{len(batches)} batch(es)"
-            + (f", omitted {omitted} chars" if omitted else ""),
+            f"{len(batches)} batch(es)",
             file=sys.stderr,
         )
         for i, batch in enumerate(batches, 1):
@@ -1347,16 +1347,8 @@ def review_by_file_sessions(
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
 
-    truncated = stats["chars_omitted"] > 0
-    if truncated:
-        print(
-            f"WARNING: omitted {stats['chars_omitted']} chars of review text "
-            f"(should not happen; report a bug). Those lines were not sent "
-            f"to Gemini and issues there may be missing",
-            file=sys.stderr,
-        )
     print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
-    return all_issues, total_duration, truncated, stats
+    return all_issues, total_duration, stats
 
 
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1403,7 +1395,6 @@ def main(argv: list[str] | None = None) -> int:
             status="PASSED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="Out of path scope / empty diff — Gemini API not called",
             files=[],
         )
@@ -1426,7 +1417,6 @@ def main(argv: list[str] | None = None) -> int:
             status="PASSED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="No added lines — Gemini API not called",
             files=files,
         )
@@ -1440,7 +1430,6 @@ def main(argv: list[str] | None = None) -> int:
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note="GEMINI_API_KEY is missing",
             files=files,
         )
@@ -1451,7 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        raw_issues, duration, truncated, usage_stats = review_by_file_sessions(
+        raw_issues, duration, usage_stats = review_by_file_sessions(
             api_key, review_by_file
         )
         kept = postprocess_issues(raw_issues, added_details)
@@ -1465,7 +1454,6 @@ def main(argv: list[str] | None = None) -> int:
             status="FAILED",
             issues=[],
             duration_sec=None,
-            truncated=False,
             extra_note=f"fail-closed: {exc}",
             files=files,
         )
@@ -1482,7 +1470,6 @@ def main(argv: list[str] | None = None) -> int:
         status=status,
         issues=kept,
         duration_sec=duration,
-        truncated=truncated,
         usage=usage,
         usage_stats=usage_stats,
         files=files,
