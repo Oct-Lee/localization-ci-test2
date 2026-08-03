@@ -17,7 +17,6 @@ from typing import Any, NamedTuple
 
 import requests
 
-
 class GeminiModelQuota(NamedTuple):
     model_id: str
     rpm: int
@@ -96,55 +95,64 @@ SKIP_LINE_RE = re.compile(
     r"""(?x)^\s*(?:import\b|from\b|export\s+default\b|export\s+const\b|
     const\s+\w+\s*=\s*\{|/\*|^\s*\*|^\s*//|\}|\{|,|\#)"""
 )
-# Syntax-only FP signals (identifier/key typos are forced to low elsewhere — not dropped here).
-SYNTAX_PROBLEM_RE = re.compile(
-    r"missing comma|extra comma|\bsyntax\b|missing colon|json structure|"
-    r"javascript syntax|python syntax|typescript syntax|\bbrace\b|\bquote\b",
+NON_USERFACING_PROBLEM_RE = re.compile(
+    r"missing comma|extra comma|syntax|object key|property name|variable name|"
+    r"constant name|identifier|key name|missing colon|json structure|"
+    r"javascript syntax|python syntax|typescript syntax",
     re.IGNORECASE,
 )
 SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW = "high", "medium", "low"
 VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-# Deterministic safety net when Gemini misses a known VALUE typo (not a prompt list).
 KNOWN_VALUE_TYPOS: tuple[tuple[str, str, str], ...] = (
     ("神经网路", "神经网络", "Spelling: 神经网路 should be 神经网络"),
 )
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
-_ID_PROBLEM_TOKENS = (
-    "identifier", "constant name", "key name", "object key", "property name",
-    "variable name", "key typo",
-)
-_COMPLETE_FINISH_REASONS = frozenset({"STOP", "stop", "FINISH_REASON_STOP"})
-_ISSUE_SCHEMA: dict[str, Any] = {
-    "type": "OBJECT",
-    "properties": {
-        "file": {"type": "STRING"},
-        "line": {"type": "INTEGER"},
-        "original": {"type": "STRING"},
-        "problem": {"type": "STRING"},
-        "suggestion": {"type": "STRING"},
-        "severity": {"type": "STRING", "enum": ["high", "medium", "low"]},
-    },
-    "required": ["original", "problem", "suggestion", "severity"],
-}
-RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "OBJECT",
-    "properties": {
-        "has_issue": {"type": "BOOLEAN"},
-        "issues": {"type": "ARRAY", "items": _ISSUE_SCHEMA},
-    },
-    "required": ["has_issue", "issues"],
-}
-# Minimal task brief; filtering / severity policy lives in code + responseSchema.
-_PROMPT_BRIEF = (
-    "Review user-facing string VALUES only (EN / zh-CN / pt-PT) in the PR hunks below. "
-    "Flag spelling/grammar as high, wording as medium, value casing/style as low. "
-    "Ignore syntax and key/identifier names. Keep placeholders unchanged."
-)
+_ID_PROBLEM_TOKENS = ("identifier", "constant name", "key name", "object key", "property name", "variable name", "key typo")
 
 
 def build_prompt(review_text: str) -> str:
-    return f"{_PROMPT_BRIEF}\n\n{review_text}\n"
+    return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
+Review ONLY user-facing string VALUES in the PR changes below (English / Simplified Chinese / Portuguese).
+
+Formats: JS/TS `KEY: 'value'` or multiline KEY:\\n  'value'; Python `KEY = "..."` or KEY = (\\n  "..."\\n);
+JSON `"key": "value"`; CSV: key,zh-CN,en-US,pt-PT — review language cell VALUES, not keys.
+Lines tagged `user_facing: ...` are highest priority.
+
+Rules:
+1) Focus on quoted VALUES. For value fixes, original/suggestion = value only, not whole KEY lines.
+2) Prefer IGNORE constant/key/identifier typos (SCREAMING_SNAKE / camelCase / CONSOLE_lOG_*).
+   If you still report one, severity MUST be "low" (never blocks). Only VALUES may be high/medium.
+3) IGNORE syntax/structure: commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
+4) Multiline KEY + value on next line is VALID — never flag "missing comma" on the key line; review the value.
+5) Placeholders {{...}}, %s/%d/%w, ${{...}}, Python {{}} must stay identical. NEVER suggest inventing
+   or removing placeholders (e.g. do not add %d to "个物料模拟失败:").
+
+Ignore: imports, exports, URLs, paths, UUIDs, hashes, debug-only text, internal comments, identifier/key names.
+
+Examples (good):
+- FILE_CAMERA_NOT_SELECT: 'File Camera not select' → original "File Camera not select",
+  suggestion "File Camera not selected", severity "high"
+- Multiline KEY + value: review only the quoted string; do NOT flag key line syntax
+- cencel: 'Cencel' → report ONLY the value typo "Cencel"→"Cancel" (high); do NOT report the key
+
+Examples (DO NOT emit):
+- CONSOLE_lOG_SEARCH_SIGNAL / FLEX_LIGNT_CONTROL_TITLE key/identifier casing or spelling
+
+Casing: fix the word, not capitalization. "not Founded" → "not found" (NEVER suggest "Found").
+Chinese character typos in VALUES are HIGH (e.g. 己→已). Check every user_facing VALUE.
+
+Severity (lowercase): HIGH = spelling/grammar/wrong word in VALUES; MEDIUM = wording/readability;
+LOW = capitalization/style of VALUES only. Only "high" blocks merge.
+
+Return JSON ONLY (no fences). Schema:
+{{"has_issue": boolean, "issues": [{{"file": string, "line": number, "original": string,
+"problem": string, "suggestion": string, "severity": "high"|"medium"|"low"}}]}}
+If no issues: {{"has_issue": false, "issues": []}}. Non-empty issues ⇒ has_issue true.
+
+PR changes to review:
+{review_text}
+"""
 
 
 def should_skip_review_line(text: str) -> bool:
@@ -185,6 +193,14 @@ def _multiline_review_chunk(
         parts.append(source_line if source_line.startswith("+") else f"+{source_line}")
     parts.extend(f"user_facing: {v}" for v in user_facing_values)
     return "\n".join(parts)
+
+
+def truncate_review_text(review_text: str, limit: int | None = None) -> tuple[str, bool]:
+    if limit is None:
+        limit = MAX_REVIEW_CHARS
+    if len(review_text) <= limit:
+        return review_text, False
+    return split_text_for_limit(review_text, limit)[0], True
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -257,8 +273,9 @@ def is_identifier_issue(issue: dict[str, Any]) -> bool:
 def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
     original = issue.get("original", "").strip()
     problem = issue.get("problem", "")
-    if SYNTAX_PROBLEM_RE.search(problem):
-        return True
+    if NON_USERFACING_PROBLEM_RE.search(problem):
+        if re.search(r"comma|syntax|colon|brace|quote", problem, re.IGNORECASE):
+            return True
     if looks_like_code_key(original) or KEY_ONLY_RE.match(original):
         suggestion = issue.get("suggestion", "").strip()
         if looks_like_code_key(suggestion) or KEY_ONLY_RE.match(suggestion):
@@ -272,7 +289,7 @@ def is_syntax_false_positive(issue: dict[str, Any]) -> bool:
         suggestion = issue.get("suggestion", "").strip()
         o_key = original.rstrip(":")
         if s_m := re.match(rf"^({PROP_KEY})\s*:?\s*,?\s*$", suggestion):
-            if s_m.group(1) == o_key:
+            if not s_m or s_m.group(1) == o_key:
                 return True
         else:
             return True
@@ -289,6 +306,7 @@ def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[st
             continue
         if is_identifier_issue(normalized):
             normalized["severity"] = SEVERITY_LOW
+        normalized.pop("_invalid", None)
         normalized.pop("_kind", None)
         kept.append(normalized)
     return kept, dropped
@@ -450,48 +468,23 @@ def print_files_report(files: list[dict[str, Any]]) -> None:
         print(f"  {item['path']}  +{item['added']} -{item['deleted']}", file=sys.stderr)
 
 
-def _value_exact_in_line(needle: str, text: str) -> bool:
-    stripped = text.strip().rstrip(",").strip()
-    if needle == stripped:
-        return True
-    if m := ASSIGNMENT_LINE_RE.match(stripped):
-        return m.group(3) == needle
-    if m := JSON_KV_RE.match(stripped):
-        return m.group(2) == needle
-    if m := STRING_VALUE_LINE_RE.match(stripped):
-        return m.group(2) == needle
-    return False
-
-
 def attach_locations(
     issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Fill missing file/line only; never overwrite a positive line; require a unique hit."""
     enriched = []
     for issue in issues:
         out = dict(issue)
         needle = (out.get("original") or "").strip()
-        if not needle:
-            enriched.append(out)
-            continue
-        if out.get("file") and isinstance(out.get("line"), int) and out["line"] > 0:
-            enriched.append(out)
-            continue
-        paths = [out["file"]] if out.get("file") in added_details else list(added_details)
-        exact, soft = [], []
-        for path in paths:
-            for row in added_details.get(path, []):
-                text = row["text"]
-                hit = (path, row["line"])
-                if _value_exact_in_line(needle, text):
-                    exact.append(hit)
-                elif f'"{needle}"' in text or f"'{needle}'" in text:
-                    soft.append(hit)
-                elif len(needle) >= 8 and needle in text:
-                    soft.append(hit)
-        hits = exact or soft
-        if len(hits) == 1:
-            out["file"], out["line"] = hits[0]
+        if needle:
+            matched = False
+            for path, rows in added_details.items():
+                for row in rows:
+                    if needle in row["text"]:
+                        out["file"], out["line"] = path, row["line"]
+                        matched = True
+                        break
+                if matched:
+                    break
         enriched.append(out)
     return enriched
 
@@ -502,23 +495,10 @@ def strip_markdown_fence(text: str) -> str:
 
 
 def extract_response_text(api_payload: dict[str, Any]) -> str:
-    assert_generation_complete(api_payload)
     try:
         return api_payload["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"Unexpected Gemini response shape: {exc}") from exc
-
-
-def assert_generation_complete(api_payload: dict[str, Any]) -> None:
-    try:
-        candidate = api_payload["candidates"][0]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Gemini response has no candidates: {exc}") from exc
-    reason = candidate.get("finishReason") or candidate.get("finish_reason")
-    if reason is None:
-        return
-    if reason not in _COMPLETE_FINISH_REASONS:
-        raise ValueError(f"Gemini generation incomplete: finishReason={reason!r}")
 
 
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -535,10 +515,11 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("has_issue=false but issues is non-empty")
     if issues and payload["has_issue"] is not True:
         raise ValueError("issues is non-empty but has_issue is not true")
-    validated_issues, skipped_reasons = [], []
+    validated_issues, skipped = [], 0
     for i, issue in enumerate(issues):
         if not isinstance(issue, dict):
-            skipped_reasons.append(f"issues[{i}]: not an object")
+            skipped += 1
+            print(f"Skipping issues[{i}]: not an object", file=sys.stderr)
             continue
         bad_field = None
         for field in ("original", "problem", "suggestion", "severity"):
@@ -549,11 +530,13 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
                 bad_field = f"empty {field}"
                 break
         if bad_field:
-            skipped_reasons.append(f"issues[{i}]: {bad_field}")
+            skipped += 1
+            print(f"Skipping issues[{i}]: {bad_field}", file=sys.stderr)
             continue
         severity = issue["severity"].strip().lower()
         if severity not in VALID_SEVERITIES:
-            skipped_reasons.append(f"issues[{i}]: invalid severity {issue['severity']!r}")
+            skipped += 1
+            print(f"Skipping issues[{i}]: invalid severity {issue['severity']!r}", file=sys.stderr)
             continue
         item: dict[str, Any] = {
             "original": issue["original"].strip(),
@@ -569,13 +552,8 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
             except (TypeError, ValueError):
                 item["line"] = -1
         validated_issues.append(item)
-    if skipped_reasons:
-        for reason in skipped_reasons[:10]:
-            print(f"Malformed model issue: {reason}", file=sys.stderr)
-        raise ValueError(
-            f"Dropped {len(skipped_reasons)} malformed issue(s) from model output "
-            "(fail-closed; refusing partial/invalid result)"
-        )
+    if skipped:
+        print(f"Dropped {skipped} malformed issue(s) from model output", file=sys.stderr)
     has_issue = bool(validated_issues)
     if payload["has_issue"] is False and validated_issues:
         has_issue = True
@@ -710,14 +688,7 @@ def _sleep_transient_backoff(attempt: int) -> None:
 
 
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-            "responseSchema": RESPONSE_SCHEMA,
-        },
-    }
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0}}
     start = time.monotonic()
     quota_retries = transient_attempts = 0
     while True:
@@ -855,19 +826,12 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
     )
 
 
-def split_into_batches(review_text: str, limit: int | None = None) -> list[str]:
+def split_into_batches(review_text: str, limit: int | None = None) -> tuple[list[str], int]:
     if limit is None:
         limit = MAX_REVIEW_CHARS
     if not review_text.strip():
-        return []
-    return split_text_for_limit(review_text, limit)
-
-
-def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -> str:
-    """Re-anchor hard-split batches so mid-file cuts still carry # file context."""
-    if batch_index == 0 or batch.lstrip().startswith("# file:"):
-        return batch
-    return f"# file: {path}\n# note: continuation of previous batch\n\n{batch}"
+        return [], 0
+    return split_text_for_limit(review_text, limit), 0
 
 
 def deterministic_known_typo_issues(
@@ -944,17 +908,18 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        batches = split_into_batches(text)
+        batches, omitted = split_into_batches(text)
+        stats["chars_omitted"] += omitted
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
         print(
-            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es)",
+            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es)"
+            + (f", omitted {omitted} chars" if omitted else ""),
             file=sys.stderr,
         )
-        for i, raw_batch in enumerate(batches):
-            batch = with_batch_continuation_header(path, raw_batch, batch_index=i)
+        for i, batch in enumerate(batches, 1):
             if len(batches) > 1:
-                print(f"  batch {i + 1}/{len(batches)}: {len(batch)} chars", file=sys.stderr)
+                print(f"  batch {i}/{len(batches)}: {len(batch)} chars", file=sys.stderr)
             quota = active_model_quota()
             interval = min_request_interval_sec(quota.rpm)
             if last_request_at > 0:
@@ -980,8 +945,16 @@ def review_by_file_sessions(
                 if not issue.get("file"):
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
+    truncated = stats["chars_omitted"] > 0
+    if truncated:
+        print(
+            f"WARNING: omitted {stats['chars_omitted']} chars of review text "
+            f"(should not happen; report a bug). Those lines were not sent to Gemini "
+            f"and issues there may be missing",
+            file=sys.stderr,
+        )
     print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
-    return all_issues, total_duration, False, stats
+    return all_issues, total_duration, truncated, stats
 
 
 def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
