@@ -1,4 +1,4 @@
-name: Gemini Localization Quality Gate
+name: Localization Quality Gate
 
 on:
   pull_request:
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   localization-review:
-    name: Gemini Localization Quality Gate
+    name: Localization Quality Gate
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -94,8 +94,9 @@ jobs:
       - name: Install dependencies
         if: steps.scoped_diff.outputs.in_scope == 'true'
         run: |
-          python -m pip install -r requirements.txt
+          python -c "import requests" 2>/dev/null \
+            || python -m pip install "requests>=2.31.0,<3"
 
-      - name: Run localization quality review
+      - name: Run localization quality gate
         if: steps.scoped_diff.outputs.in_scope == 'true'
-        run: python scripts/gemini_localization_review.py pr.diff
+        run: python .github/workflows/tools/localization_quality_gate.py pr.diff
