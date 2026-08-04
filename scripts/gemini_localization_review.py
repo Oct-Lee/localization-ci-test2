@@ -27,7 +27,7 @@ api_key = os.environ["GEMINI_API_KEY"]
 url = (
     "https://generativelanguage.googleapis.com/"
     "v1beta/models/"
-    "gemini-2.5-flash:generateContent"
+    "gemini-3.1-flash-lite:generateContent"
     f"?key={api_key}"
 )
 
