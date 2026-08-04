@@ -1085,9 +1085,21 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
         if response.status_code in (500, 503):
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
+                if try_advance_model(
+                    f"HTTP {response.status_code} after {MAX_ATTEMPTS} attempts on {model_id}"
+                ):
+                    quota_retries = transient_attempts = 0
+                    pace_after_model_failover()
+                    continue
                 raise RuntimeError(
-                    f"Gemini API failed with HTTP {response.status_code}: {response.text[:1000]}"
+                    f"Gemini API failed with HTTP {response.status_code} on all models "
+                    f"({', '.join(GEMINI_MODELS)}): {response.text[:1000]}"
                 )
+            print(
+                f"HTTP {response.status_code} on {model_id}. "
+                f"Retry {transient_attempts}/{MAX_ATTEMPTS} then failover if still failing",
+                file=sys.stderr,
+            )
             _sleep_transient_backoff(transient_attempts)
             continue
         raise RuntimeError(
