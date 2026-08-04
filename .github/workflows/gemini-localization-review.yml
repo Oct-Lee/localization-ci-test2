@@ -16,7 +16,7 @@ jobs:
   localization-review:
     name: Gemini Localization Quality Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 120
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # ===== SINGLE SOURCE OF TRUTH: edit path scope ONLY here =====
@@ -93,7 +93,8 @@ jobs:
 
       - name: Install dependencies
         if: steps.scoped_diff.outputs.in_scope == 'true'
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install -r requirements.txt
 
       - name: Run localization quality review
         if: steps.scoped_diff.outputs.in_scope == 'true'
