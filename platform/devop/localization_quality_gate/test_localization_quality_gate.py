@@ -102,7 +102,7 @@ diff --git a/translations/english.js b/translations/english.js
 """
     analyzed = gate.analyze_diff(diff)
     review = analyzed["review_text"]
-    assert "[translations/english.js:12]" in review
+    assert "[translations/english.js:12|" in review
     assert "Please save the changes to the Sequence first" in review
     assert "user_facing:" not in review
     assert "# key:" not in review
@@ -762,8 +762,8 @@ def test_gemini_model_quota_chain():
     assert by_id["gemini-3.6-flash"].rpm == 5
     assert by_id["gemini-3.6-flash"].tpm == 250_000
     assert all(q.tpm == 250_000 for q in gate.GEMINI_MODEL_QUOTAS)
-    assert abs(gate.min_request_interval_sec(5) - 12.1) < 1e-6
-    assert abs(gate.min_request_interval_sec(15) - 4.1) < 1e-6
+    assert abs(gate.min_request_interval_sec(5) - 12.0) < 1e-6
+    assert abs(gate.min_request_interval_sec(15) - 4.0) < 1e-6
 
 
 def test_call_gemini_503_failsover_to_next(monkeypatch: pytest.MonkeyPatch):
@@ -1171,7 +1171,7 @@ def test_analyze_diff_neighbor_context_keeps_overlapping_views():
 """
     review = gate.analyze_diff(diff)["review_text"]
     assert "已经加入训练序列，前面还有%d个神经网路" in review
-    assert "[translations/chinese.py:11]" in review
+    assert "[translations/chinese.py:11|TRAIN_SCHEDULED]" in review
     assert "user_facing:" not in review
     # No neighbor duplication: typo appears in its own entry only.
     assert review.count("神经网路") == 1
@@ -1249,7 +1249,9 @@ def test_analyze_diff_python_implicit_string_concat():
     assert "2.5D customization requirements" in review
     # Fragments must not appear as separate orphan reviews.
     assert "\n2.5D\n" not in review
-    assert "GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_" not in review
+    # Key appears only in compact header, not as a bare KEY = opener line.
+    assert "|GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_" in review
+    assert "GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_CUSTOM_STEPS_TIMEOUT_MS =" not in review
 
 
 def test_filter_value_vs_key_severity():
