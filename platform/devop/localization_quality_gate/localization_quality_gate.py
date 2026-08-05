@@ -983,17 +983,11 @@ def format_step_summary(
         f"- Status: {status}",
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} | Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Token usage: {usage}",
     ]
     if usage_stats:
-        models_s, limits_s = _models_and_limits_text(usage_stats, compact=False)
-        lines.extend([
-            f"- Models: {models_s}",
-            f"- API requests: {usage_stats['requests']} (paced ≥{usage_stats['min_interval_sec']:.1f}s; limits {limits_s})",
-            f"- Tokens: prompt={usage_stats['prompt_tokens']} candidates={usage_stats['candidates_tokens']} total={usage_stats['total_tokens']}",
-            f"- Review payload: sent={usage_stats['chars_sent']} chars, "
-            f"batches={usage_stats['batches']}, files={usage_stats['files_reviewed']}",
-        ])
+        lines.extend(f"- {line}" for line in format_usage_lines(usage_stats))
+    else:
+        lines.append(f"- Token usage: {usage}")
     if extra_note:
         lines.append(f"- Note: {extra_note}")
     lines.extend(["", "### Changed files", ""])
@@ -1168,6 +1162,7 @@ def empty_usage_stats() -> dict[str, Any]:
         "models_used": [], "model_limits": {},
         "rpm_limit": primary.rpm, "tpm_limit": primary.tpm or 0, "rpd_limit": primary.rpd,
         "min_interval_sec": min_request_interval_sec(primary.rpm),
+        "wall_sec": 0.0, "effective_rpm": None,
     }
 
 
@@ -1206,15 +1201,34 @@ def _models_and_limits_text(stats: dict[str, Any], *, compact: bool = False) -> 
     return models_s, limits_s
 
 
+def format_usage_lines(stats: dict[str, Any]) -> list[str]:
+    """Clear usage lines: effective RPM, RPD this run, total tokens, request scope."""
+    models_s, _ = _models_and_limits_text(stats, compact=False)
+    eff = stats.get("effective_rpm")
+    rpm_s = f"{eff:.1f}/min effective" if isinstance(eff, (int, float)) else "N/A"
+    return [
+        f"RPM: {rpm_s} (limit {stats['rpm_limit']})",
+        f"RPD: {stats['requests']} this run (limit {stats['rpd_limit']})",
+        (
+            f"Tokens: total={stats['total_tokens']} "
+            f"(prompt={stats['prompt_tokens']}, candidates={stats['candidates_tokens']})"
+        ),
+        (
+            f"Requests: {stats['requests']} on {models_s} "
+            f"(pace ≥{stats['min_interval_sec']:.1f}s; batches={stats['batches']}, "
+            f"files={stats['files_reviewed']}, chars={stats['chars_sent']})"
+        ),
+    ]
+
+
 def format_usage_summary(stats: dict[str, Any]) -> str:
-    models_s, limits_s = _models_and_limits_text(stats, compact=True)
-    return (
-        f"requests={stats['requests']} (limits {limits_s}), models={models_s}, "
-        f"prompt_tokens={stats['prompt_tokens']}, candidates_tokens={stats['candidates_tokens']}, "
-        f"total_tokens={stats['total_tokens']}, chars_sent={stats['chars_sent']}, "
-        f"batches={stats['batches']}, "
-        f"files={stats['files_reviewed']}, pace>={stats['min_interval_sec']:.1f}s/req"
-    )
+    return " | ".join(format_usage_lines(stats))
+
+
+def print_usage_summary(stats: dict[str, Any]) -> None:
+    print("Usage:", file=sys.stderr)
+    for line in format_usage_lines(stats):
+        print(f"  {line}", file=sys.stderr)
 
 
 def review_chunks(review_text: str) -> list[str]:
@@ -1384,6 +1398,7 @@ def review_by_file_sessions(
     api_key: str, review_by_file: dict[str, str],
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
+    wall_t0 = time.monotonic()
     for path, text in review_by_file.items():
         if not text.strip():
             continue
@@ -1432,7 +1447,11 @@ def review_by_file_sessions(
                 if not issue.get("file"):
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
-    print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
+    if stats["requests"] > 0:
+        stats["wall_sec"] = time.monotonic() - wall_t0
+        if stats["wall_sec"] > 0:
+            stats["effective_rpm"] = stats["requests"] / (stats["wall_sec"] / 60.0)
+    print_usage_summary(stats)
     return all_issues, total_duration, stats
 
 
