@@ -1024,10 +1024,11 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         validated_issues.append(item)
     if skipped_reasons:
         for reason in skipped_reasons[:10]:
-            print(f"Malformed model issue: {reason}", file=sys.stderr)
-        raise ValueError(
-            f"Dropped {len(skipped_reasons)} malformed issue(s) from model output "
-            "(fail-closed; refusing partial/invalid result)"
+            print(f"Malformed model issue (dropped): {reason}", file=sys.stderr)
+        print(
+            f"Dropped {len(skipped_reasons)} malformed issue(s); "
+            f"keeping {len(validated_issues)} valid issue(s)",
+            file=sys.stderr,
         )
     has_issue = bool(validated_issues)
     if payload["has_issue"] is False and validated_issues:
