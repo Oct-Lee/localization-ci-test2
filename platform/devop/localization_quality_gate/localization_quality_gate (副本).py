@@ -7,8 +7,6 @@ Env: GEMINI_API_KEY (required), GITHUB_STEP_SUMMARY (optional)
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 import os
 import re
@@ -50,8 +48,7 @@ CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused
 # Paths that need smaller focused batches for CJK/PT recall.
 _FOCUSED_PATH_RE = re.compile(
     r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
-    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.|"
-    r"i18n\.csv|(?:^|/)translation$|dimensional/ui/translations\.py)",
+    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.)",
     re.IGNORECASE,
 )
 RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
@@ -122,21 +119,6 @@ KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
 # Nested object / array openers in TS/JS locale maps — not user-facing VALUES.
 STRUCT_OPEN_RE = re.compile(rf"^\s*{PROP_KEY}\s*:\s*[{{\[]\s*,?\s*$")
-# "outer.key": {  or  "中文键": {  — structure only (unless outer key is user-facing prose).
-QUOTED_KEY_STRUCT_OPEN_RE = re.compile(
-    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{\s*,?\s*$'''
-)
-# Single-line nested locale object: "btn.save": {"en": "Save", "zh": "保存"},
-NESTED_LOCALE_OBJECT_RE = re.compile(
-    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{(?P<body>.*)\}\s*,?\s*$'''
-)
-NESTED_LOCALE_PAIR_RE = re.compile(
-    r'''"(?P<lang>(?:\\.|[^"\\])*)"\s*:\s*"(?P<val>(?:\\.|[^"\\])*)"'''
-)
-_LOCALE_LANG_KEYS = frozenset({
-    "en", "zh", "pt", "en-us", "zh-cn", "pt-pt", "pt-br", "zh-hans", "zh-hant",
-    "english", "chinese", "portuguese",
-})
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
@@ -199,8 +181,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
-Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON;
-i18n CSV (key,zh,en,pt cells); nested locale objects ("key": {{"en": "...", "zh": "..."}}).
+Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
 Input entries use compact form [file:line] or [file:line|key] then the VALUE
 (file/line required for PR annotations; |key is optional context).
 Multiline VALUES encode embedded newlines as \\n (one line under the header).
@@ -231,82 +212,23 @@ def should_skip_review_line(text: str) -> bool:
     return not stripped or SKIP_LINE_RE.match(stripped) or stripped in _STRUCT_TOKENS
 
 
-def _json_unescape(value: str) -> str:
-    try:
-        return json.loads(f'"{value}"')
-    except json.JSONDecodeError:
-        return (
-            value.replace(r"\"", '"')
-            .replace(r"\\", "\\")
-            .replace(r"\n", "\n")
-            .replace(r"\t", "\t")
-        )
-
-
-def _looks_like_user_facing_locale_key(key: str) -> bool:
-    """True when an object key is itself display text (e.g. Chinese source string)."""
-    if any(ord(c) > 127 for c in key):
-        return True
-    return " " in key and not key.startswith("msg.") and "." not in key.split(" ")[0]
-
-
-def parse_i18n_csv_row(text: str) -> tuple[str, list[str]] | None:
-    """Parse one i18n CSV row → (key, language VALUES). Skips header / invalid rows."""
-    try:
-        rows = list(csv.reader(io.StringIO(text)))
-    except csv.Error:
-        return None
-    if not rows:
-        return None
-    parts = [p for p in rows[0]]
-    if len(parts) < 2:
-        return None
-    key = parts[0].strip()
-    if not key or key.lower() == "key":
-        return None
-    values = [p for p in parts[1:] if p != ""]
-    if not values:
-        return None
-    return key, values
-
-
-def extract_nested_locale_values(text: str) -> tuple[str, list[str]] | None:
-    """Extract VALUES from "id": {"en": "...", "zh": "..."} / Chinese/English maps."""
-    m = NESTED_LOCALE_OBJECT_RE.match(text.strip())
-    if not m:
-        return None
-    key = _json_unescape(m.group("key"))
-    values: list[str] = []
-    for pm in NESTED_LOCALE_PAIR_RE.finditer(m.group("body")):
-        lang = _json_unescape(pm.group("lang")).lower()
-        if lang in _LOCALE_LANG_KEYS:
-            values.append(_json_unescape(pm.group("val")))
-    if not values:
-        return None
-    return key, values
-
-
 def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
     stripped = text.strip()
     if not stripped or should_skip_review_line(stripped):
         return []
     if m := JSON_KV_RE.match(stripped):
-        return [_json_unescape(m.group(2))]
-    if nested := extract_nested_locale_values(stripped):
-        return nested[1]
+        return [m.group(2)]
     if m := ASSIGNMENT_LINE_RE.match(stripped):
         return [m.group(3)]
     if m := STRING_VALUE_LINE_RE.match(stripped):
         return [m.group(2)]
     lower_path = path.lower()
-    if lower_path.endswith(".csv") or lower_path.endswith("i18n.csv"):
-        parsed = parse_i18n_csv_row(stripped)
-        return list(parsed[1]) if parsed else []
-    # Heuristic CSV row (no path / unknown): require key-like first cell.
-    if "," in stripped and not stripped.startswith(("'", '"', "{", "[")):
-        parsed = parse_i18n_csv_row(stripped)
-        if parsed:
-            return list(parsed[1])
+    if lower_path.endswith(".csv") or stripped.count(",") >= 2:
+        if stripped.lower().startswith("key,"):
+            return []
+        parts = [p.strip() for p in stripped.split(",")]
+        if len(parts) >= 2 and parts[0]:
+            return [p for p in parts[1:] if p]
     return []
 
 
@@ -798,36 +720,10 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             if STRUCT_OPEN_RE.match(text):
                 # Nested map/array openers (e.g. configTool: {) are not VALUES.
                 continue
-            hints: list[str] = []
+            hints = extract_user_facing_hints(text, path_label)
             key_name = None
-            path_lower = path_label.lower()
-            is_csv = path_lower.endswith(".csv")
-            if is_csv:
-                if csv_row := parse_i18n_csv_row(text.strip()):
-                    # i18n CSV: key,zh-CN,en-US,pt-PT — csv.reader keeps quoted commas intact.
-                    key_name, hints = csv_row[0], list(csv_row[1])
-                else:
-                    continue  # header / empty / non-row
-            if not hints:
-                if nested := extract_nested_locale_values(text.strip()):
-                    key_name, hints = nested[0], list(nested[1])
-            if not hints:
-                if q_open := QUOTED_KEY_STRUCT_OPEN_RE.match(text.strip()):
-                    outer_key = _json_unescape(q_open.group("key"))
-                    # standard_postprocess/translation uses Chinese prose as object keys.
-                    if _looks_like_user_facing_locale_key(outer_key):
-                        hints = [outer_key]
-                    else:
-                        continue
-            if not hints:
-                hints = extract_user_facing_hints(text, path_label)
-                if assign := ASSIGNMENT_LINE_RE.match(text):
-                    key_name = assign.group(1)
-                elif jkv := JSON_KV_RE.match(text.strip()):
-                    # "Chinese": "…" / "en": "…" — lang label is not the catalog key.
-                    lang = _json_unescape(jkv.group(1))
-                    if lang.lower() not in _LOCALE_LANG_KEYS:
-                        key_name = lang
+            if assign := ASSIGNMENT_LINE_RE.match(text):
+                key_name = assign.group(1)
             if not hints:
                 # Unstructured added text (no KEY/JSON extract): review the line body
                 # as VALUE — same coverage as the old raw-window path, without metadata.
@@ -1305,33 +1201,11 @@ def _models_and_limits_text(stats: dict[str, Any], *, compact: bool = False) -> 
     return models_s, limits_s
 
 
-def compute_effective_rpm(
-    request_count: int, first_start: float, last_start: float,
-) -> float | None:
-    """Achieved RPM from request *start* spacing (same basis as pacing).
-
-    Naive ``requests / wall_sec`` over-counts short runs: the gap before the
-    first start is missing, so 2 requests ~4s apart look like ~20+/min.
-    With N≥2 starts, ``(N-1) / span`` matches the paced start rate (≤ limit).
-    """
-    if request_count < 2:
-        return None
-    span = last_start - first_start
-    if span <= 0:
-        return None
-    return (request_count - 1) / (span / 60.0)
-
-
 def format_usage_lines(stats: dict[str, Any]) -> list[str]:
     """Clear usage lines: effective RPM, RPD this run, total tokens, request scope."""
     models_s, _ = _models_and_limits_text(stats, compact=False)
     eff = stats.get("effective_rpm")
-    if isinstance(eff, (int, float)):
-        rpm_s = f"{eff:.1f}/min effective"
-    elif stats.get("requests", 0) < 2:
-        rpm_s = "N/A (<2 requests)"
-    else:
-        rpm_s = "N/A"
+    rpm_s = f"{eff:.1f}/min effective" if isinstance(eff, (int, float)) else "N/A"
     return [
         f"RPM: {rpm_s} (limit {stats['rpm_limit']})",
         f"RPD: {stats['requests']} this run (limit {stats['rpd_limit']})",
@@ -1525,7 +1399,6 @@ def review_by_file_sessions(
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
     wall_t0 = time.monotonic()
-    first_request_at = 0.0
     for path, text in review_by_file.items():
         if not text.strip():
             continue
@@ -1560,8 +1433,6 @@ def review_by_file_sessions(
                     )
                     time.sleep(wait)
             last_request_at = time.monotonic()
-            if first_request_at <= 0:
-                first_request_at = last_request_at
             api_payload, duration = call_gemini(api_key, build_prompt(batch))
             total_duration += duration
             stats["requests"] += 1
@@ -1578,9 +1449,8 @@ def review_by_file_sessions(
             all_issues.extend(parsed["issues"])
     if stats["requests"] > 0:
         stats["wall_sec"] = time.monotonic() - wall_t0
-        stats["effective_rpm"] = compute_effective_rpm(
-            stats["requests"], first_request_at, last_request_at,
-        )
+        if stats["wall_sec"] > 0:
+            stats["effective_rpm"] = stats["requests"] / (stats["wall_sec"] / 60.0)
     print_usage_summary(stats)
     return all_issues, total_duration, stats
 
