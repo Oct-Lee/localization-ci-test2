@@ -15,6 +15,7 @@ import re
 import sys
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import requests
@@ -47,6 +48,8 @@ SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 5
 CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused batches
+# Intentional false-positive suppressions (file optional; original exact VALUE match).
+ALLOWLIST_PATH = Path(__file__).resolve().parent / "allowlist.json"
 # Paths that need smaller focused batches for CJK/PT recall.
 _FOCUSED_PATH_RE = re.compile(
     r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
@@ -1061,6 +1064,69 @@ def filter_placeholder_mismatches(
     return kept, dropped
 
 
+def load_allowlist(path: Path | None = None) -> list[dict[str, str]]:
+    """Load allowlist.json: [{"original": "...", "file": "optional/path"}, ...]."""
+    allowlist_path = path if path is not None else ALLOWLIST_PATH
+    if not allowlist_path.is_file():
+        return []
+    try:
+        raw = json.loads(allowlist_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Allowlist ignored (unreadable): {allowlist_path}: {exc}", file=sys.stderr)
+        return []
+    if not isinstance(raw, list):
+        print(f"Allowlist ignored (root must be array): {allowlist_path}", file=sys.stderr)
+        return []
+    entries: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        original = item.get("original")
+        if not isinstance(original, str) or not original:
+            continue
+        entry: dict[str, str] = {"original": original}
+        file_path = item.get("file")
+        if isinstance(file_path, str) and file_path.strip():
+            entry["file"] = file_path.strip().replace("\\", "/")
+        entries.append(entry)
+    return entries
+
+
+def _allowlist_file_match(issue_file: str, allow_file: str) -> bool:
+    issue_file = (issue_file or "").replace("\\", "/")
+    allow_file = allow_file.replace("\\", "/")
+    return issue_file == allow_file or issue_file.endswith("/" + allow_file)
+
+
+def is_allowlisted(issue: dict[str, Any], entries: list[dict[str, str]]) -> bool:
+    original = issue.get("original")
+    if not isinstance(original, str):
+        return False
+    issue_file = str(issue.get("file") or "")
+    for entry in entries:
+        if entry["original"] != original:
+            continue
+        allow_file = entry.get("file")
+        if not allow_file or _allowlist_file_match(issue_file, allow_file):
+            return True
+    return False
+
+
+def filter_allowlisted(
+    issues: list[dict[str, Any]], entries: list[dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    allow = entries if entries is not None else load_allowlist()
+    if not allow:
+        return issues, []
+    kept, dropped = [], []
+    for issue in issues:
+        if is_allowlisted(issue, allow):
+            dropped.append(issue)
+        else:
+            kept.append(issue)
+    return kept, dropped
+
+
 def count_by_severity(issues: list[dict[str, str]]) -> dict[str, int]:
     counts = {SEVERITY_HIGH: 0, SEVERITY_MEDIUM: 0, SEVERITY_LOW: 0}
     for issue in issues:
@@ -1514,6 +1580,9 @@ def postprocess_issues(
             "(suggestion must not add/remove placeholders like %d / {id})",
             show_samples=True,
         )
+    kept, allow_dropped = filter_allowlisted(kept)
+    if allow_dropped:
+        _log_filtered(allow_dropped, "allowlisted issue(s)")
     before = len(kept)
     kept = dedupe_issues(kept)
     if len(kept) < before:
