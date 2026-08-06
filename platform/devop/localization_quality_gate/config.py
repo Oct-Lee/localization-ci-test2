@@ -1,5 +1,7 @@
 """Localization Quality Gate configuration."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import NamedTuple
 import re
@@ -42,6 +44,11 @@ _FOCUSED_PATH_RE = re.compile(
     r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
     r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.|"
     r"i18n\.csv|(?:^|/)translation$|dimensional/ui/translations\.py)",
+    re.IGNORECASE,
+)
+RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+DAILY_QUOTA_RE = re.compile(
+    r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
     re.IGNORECASE,
 )
 
@@ -105,7 +112,7 @@ VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
 _SEVERITY_RANK = {SEVERITY_HIGH: 3, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1}
 
 # ===== Response schema for Gemini =====
-_ISSUE_SCHEMA: dict[str, any] = {
+_ISSUE_SCHEMA: dict = {
     "type": "OBJECT",
     "properties": {
         "file": {"type": "STRING"},
@@ -117,7 +124,7 @@ _ISSUE_SCHEMA: dict[str, any] = {
     },
     "required": ["original", "problem", "suggestion", "severity"],
 }
-RESPONSE_SCHEMA: dict[str, any] = {
+RESPONSE_SCHEMA: dict = {
     "type": "OBJECT",
     "properties": {
         "has_issue": {"type": "BOOLEAN"},

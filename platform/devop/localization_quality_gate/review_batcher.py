@@ -1,5 +1,7 @@
 """Split review text into batches suitable for Gemini API."""
 
+from __future__ import annotations
+
 from config import (
     CONTEXT_LINES,
     FOCUSED_TARGET_BATCHES,

@@ -1,5 +1,7 @@
 """Parse Git diff and extract user-facing string values."""
 
+from __future__ import annotations
+
 import csv
 import io
 import json
@@ -9,7 +11,6 @@ from typing import Any
 
 from config import (
     ASSIGNMENT_LINE_RE,
-    CONTEXT_LINES,
     HUNK_RE,
     JSON_KV_RE,
     KEY_ONLY_LINE_RE,
@@ -23,9 +24,7 @@ from config import (
     STRUCT_OPEN_RE,
     _LOCALE_LANG_KEYS,
     _STRUCT_TOKENS,
-    # removed _looks_like_user_facing_locale_key import
 )
-from models import DiffAnalysis
 
 # ===== Helper functions =====
 def _json_unescape(value: str) -> str:
@@ -102,6 +101,34 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
             return list(parsed[1])
     return []
 
+def _escape_review_value(value: str) -> str:
+    """Escape embedded newlines in a VALUE for compact Gemini payload."""
+    return (
+        value.replace("\r\n", "\\n")
+        .replace("\r", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def _compact_review_entry(
+    path_label: str,
+    line_no: int,
+    values: list[str],
+    *,
+    key_name: str | None = None,
+) -> str:
+    cleaned = [v for v in values if v is not None and str(v) != ""]
+    if not cleaned:
+        return ""
+    header = (
+        f"[{path_label}:{line_no}|{key_name}]"
+        if key_name
+        else f"[{path_label}:{line_no}]"
+    )
+    escaped = [_escape_review_value(v) for v in cleaned]
+    return f"{header}\n" + "\\n".join(escaped)
+
+
 def _peek_multiline_string_value(
     lines: list[str], start_idx: int, *, concatenate: bool = False, max_scan: int | None = None,
 ) -> tuple[list[int], str, int] | None:
@@ -134,6 +161,7 @@ def _peek_multiline_string_value(
         return None
     return skip, "".join(parts), first_value_idx
 
+
 def _peek_triple_quoted_string(
     lines: list[str], start_idx: int, quote: str, rest: str,
 ) -> tuple[list[int], str, int] | None:
@@ -165,10 +193,124 @@ def _peek_triple_quoted_string(
         pieces.append(text)
     return None
 
-def analyze_diff(diff_text: str) -> DiffAnalysis:
+
+def add_chunk_if_new(
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+    path_label: str,
+    dedupe_key: str,
+    chunk: str,
+) -> bool:
+    if dedupe_key in seen or not chunk:
+        return False
+    seen.add(dedupe_key)
+    review_chunks.append(chunk)
+    review_by_file.setdefault(path_label, []).append(chunk)
+    return True
+
+
+def process_triple_quote_string(
+    lines: list[str],
+    idx: int,
+    line_no: int,
+    path_label: str,
+    triple: re.Match[str],
+    skip_indices: set[int],
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+) -> bool:
+    merged = _peek_triple_quoted_string(
+        lines, idx, triple.group("q"), triple.group("rest"),
+    )
+    if merged is None:
+        return False
+    skip_idxs, string_val, first_value_idx = merged
+    skip_indices.update(skip_idxs)
+    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+    key_name = triple.group(1)
+    chunk = _compact_review_entry(
+        path_label, value_line_no, [string_val], key_name=key_name,
+    )
+    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+    add_chunk_if_new(
+        seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+    )
+    return True
+
+
+def process_multiline_value(
+    lines: list[str],
+    idx: int,
+    text: str,
+    line_no: int,
+    path_label: str,
+    skip_indices: set[int],
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+) -> str:
+    key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
+    if not (key_only or py_open):
+        return "fallthrough"
+    merged = _peek_multiline_string_value(lines, idx, concatenate=bool(py_open))
+    if not merged:
+        return "skip"
+    skip_idxs, string_val, first_value_idx = merged
+    skip_indices.update(skip_idxs)
+    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+    key_name = (key_only or py_open).group(1)
+    chunk = _compact_review_entry(
+        path_label, value_line_no, [string_val], key_name=key_name,
+    )
+    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+    add_chunk_if_new(
+        seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+    )
+    return "consumed"
+
+
+def extract_user_facing_from_line(
+    text: str, path_label: str,
+) -> tuple[list[str], str | None] | None:
+    hints: list[str] = []
+    key_name: str | None = None
+    if path_label.lower().endswith(".csv"):
+        if csv_row := parse_i18n_csv_row(text.strip()):
+            key_name, hints = csv_row[0], list(csv_row[1])
+        else:
+            return None
+    if not hints:
+        if nested := extract_nested_locale_values(text.strip()):
+            key_name, hints = nested[0], list(nested[1])
+    if not hints:
+        if q_open := QUOTED_KEY_STRUCT_OPEN_RE.match(text.strip()):
+            outer_key = _json_unescape(q_open.group("key"))
+            if _looks_like_user_facing_locale_key(outer_key):
+                hints = [outer_key]
+            else:
+                return None
+    if not hints:
+        hints = extract_user_facing_hints(text, path_label)
+        if assign := ASSIGNMENT_LINE_RE.match(text):
+            key_name = assign.group(1)
+        elif jkv := JSON_KV_RE.match(text.strip()):
+            lang = _json_unescape(jkv.group(1))
+            if lang.lower() not in _LOCALE_LANG_KEYS:
+                key_name = lang
+    if not hints:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        hints = [stripped]
+    return hints, key_name
+
+
+def analyze_diff(diff_text: str) -> dict[str, Any]:
     """Parse diff text and extract user-facing values per file."""
     if not diff_text or not diff_text.strip():
-        return {"review_text": "", "review_by_file": {}, "files": [], "_added_line_details": {}}
+        return {"review_text": "", "files": []}
 
     lines = diff_text.splitlines()
     files_order: list[str] = []
@@ -183,23 +325,6 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
             files_map[path] = {"path": path, "added": 0, "deleted": 0, "added_lines": []}
             files_order.append(path)
         return files_map[path]
-
-    def _escape_review_value(value: str) -> str:
-        return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
-
-    def _compact_review_entry(
-        path_label: str,
-        line_no: int,
-        values: list[str],
-        *,
-        key_name: str | None = None,
-    ) -> str:
-        cleaned = [v for v in values if v is not None and str(v) != ""]
-        if not cleaned:
-            return ""
-        header = f"[{path_label}:{line_no}|{key_name}]" if key_name else f"[{path_label}:{line_no}]"
-        escaped = [_escape_review_value(v) for v in cleaned]
-        return f"{header}\n" + "\\n".join(escaped)
 
     for idx, line in enumerate(lines):
         if line.startswith("+++ b/"):
@@ -227,84 +352,33 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
             if idx in skip_indices:
                 continue
             path_label = current_file or "(unknown)"
-            # Triple-quoted string
             if triple := PY_TRIPLE_OPEN_RE.match(text):
-                merged_triple = _peek_triple_quoted_string(
-                    lines, idx, triple.group("q"), triple.group("rest"),
-                )
-                if merged_triple is not None:
-                    skip_idxs, string_val, first_value_idx = merged_triple
-                    skip_indices.update(skip_idxs)
-                    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
-                    key_name = triple.group(1)
-                    chunk = _compact_review_entry(path_label, value_line_no, [string_val], key_name=key_name)
-                    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                    if dedupe_key not in seen and chunk:
-                        seen.add(dedupe_key)
-                        review_chunks.append(chunk)
-                        review_by_file.setdefault(path_label, []).append(chunk)
+                if process_triple_quote_string(
+                    lines, idx, line_no, path_label, triple,
+                    skip_indices, seen, review_chunks, review_by_file,
+                ):
                     continue
-            key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
-            merged_value = None
-            if key_only or py_open:
-                merged_value = _peek_multiline_string_value(lines, idx, concatenate=bool(py_open))
-            if (key_only or py_open) and merged_value:
-                skip_idxs, string_val, first_value_idx = merged_value
-                skip_indices.update(skip_idxs)
-                value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
-                key_name = (key_only or py_open).group(1)
-                chunk = _compact_review_entry(path_label, value_line_no, [string_val], key_name=key_name)
-                dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                if dedupe_key not in seen and chunk:
-                    seen.add(dedupe_key)
-                    review_chunks.append(chunk)
-                    review_by_file.setdefault(path_label, []).append(chunk)
-                continue
-            if key_only or py_open:
+            multiline = process_multiline_value(
+                lines, idx, text, line_no, path_label,
+                skip_indices, seen, review_chunks, review_by_file,
+            )
+            if multiline in ("consumed", "skip"):
                 continue
             if should_skip_review_line(text):
                 continue
             if STRUCT_OPEN_RE.match(text):
                 continue
-            hints: list[str] = []
-            key_name = None
-            path_lower = path_label.lower()
-            is_csv = path_lower.endswith(".csv")
-            if is_csv:
-                if csv_row := parse_i18n_csv_row(text.strip()):
-                    key_name, hints = csv_row[0], list(csv_row[1])
-                else:
-                    continue
-            if not hints:
-                if nested := extract_nested_locale_values(text.strip()):
-                    key_name, hints = nested[0], list(nested[1])
-            if not hints:
-                if q_open := QUOTED_KEY_STRUCT_OPEN_RE.match(text.strip()):
-                    outer_key = _json_unescape(q_open.group("key"))
-                    if _looks_like_user_facing_locale_key(outer_key):
-                        hints = [outer_key]
-                    else:
-                        continue
-            if not hints:
-                hints = extract_user_facing_hints(text, path_label)
-                if assign := ASSIGNMENT_LINE_RE.match(text):
-                    key_name = assign.group(1)
-                elif jkv := JSON_KV_RE.match(text.strip()):
-                    lang = _json_unescape(jkv.group(1))
-                    if lang.lower() not in _LOCALE_LANG_KEYS:
-                        key_name = lang
-            if not hints:
-                stripped = text.strip()
-                if not stripped:
-                    continue
-                hints = [stripped]
-            chunk = _compact_review_entry(path_label, line_no, hints, key_name=key_name)
-            dedupe_key = f"{path_label}:{line_no}:{chunk}"
-            if dedupe_key in seen or not chunk:
+            extracted = extract_user_facing_from_line(text, path_label)
+            if extracted is None:
                 continue
-            seen.add(dedupe_key)
-            review_chunks.append(chunk)
-            review_by_file.setdefault(path_label, []).append(chunk)
+            hints, key_name = extracted
+            chunk = _compact_review_entry(
+                path_label, line_no, hints, key_name=key_name,
+            )
+            dedupe_key = f"{path_label}:{line_no}:{chunk}"
+            add_chunk_if_new(
+                seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+            )
             continue
         if line.startswith("-") and not line.startswith("---"):
             ensure_file(current_file or "(unknown)")["deleted"] += 1
@@ -317,10 +391,13 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}
-    review_text = "\n\n".join(review_chunks)
     return {
-        "review_text": review_text,
+        "review_text": "\n\n".join(review_chunks),
         "review_by_file": review_by_file_text,
         "files": files_out,
         "_added_line_details": {p: files_map[p]["added_lines"] for p in files_order},
     }
+
+
+def parse_diff(diff_text: str) -> str:
+    return analyze_diff(diff_text)["review_text"]

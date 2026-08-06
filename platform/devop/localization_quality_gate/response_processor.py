@@ -1,7 +1,10 @@
 """Process Gemini responses: validation, filtering, allowlist, dedupe, location attachment."""
 
+from __future__ import annotations
+
 import json
 import re
+import sys
 from typing import Any
 
 from config import (
@@ -24,6 +27,7 @@ from config import (
     PROP_KEY,
     _COMPLETE_FINISH_REASONS,
 )
+from diff_parser import extract_user_facing_hints
 from models import Issue
 
 # ---- Helper functions ----
@@ -33,17 +37,24 @@ def strip_markdown_fence(text: str) -> str:
         return m.group(1).strip()
     return stripped
 
-def extract_response_text(api_payload: dict[str, Any]) -> str:
-    """Extract text from Gemini response payload, ensuring generation complete."""
+
+def assert_generation_complete(api_payload: dict[str, Any]) -> None:
     try:
         candidate = api_payload["candidates"][0]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"Gemini response has no candidates: {exc}") from exc
     reason = candidate.get("finishReason") or candidate.get("finish_reason")
-    if reason is not None and reason not in _COMPLETE_FINISH_REASONS:
+    if reason is None:
+        return
+    if reason not in _COMPLETE_FINISH_REASONS:
         raise ValueError(f"Gemini generation incomplete: finishReason={reason!r}")
+
+
+def extract_response_text(api_payload: dict[str, Any]) -> str:
+    """Extract text from Gemini response payload, ensuring generation complete."""
+    assert_generation_complete(api_payload)
     try:
-        return candidate["content"]["parts"][0]["text"]
+        return api_payload["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"Unexpected Gemini response shape: {exc}") from exc
 
@@ -406,29 +417,47 @@ def recover_key_prefix_originals(
         recovered.append(out)
     return recovered
 
-# Need to import extract_user_facing_hints from diff_parser (to avoid circular, import inside functions or at top)
-# We'll import at top after definitions.
-from diff_parser import extract_user_facing_hints  # noqa: E402
+
+def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False) -> None:
+    if not dropped:
+        return
+    print(f"Filtered {len(dropped)} {label}", file=sys.stderr)
+    if show_samples:
+        for bad in dropped[:5]:
+            print(
+                f"  drop: original={bad.get('original')!r} suggestion={bad.get('suggestion')!r}",
+                file=sys.stderr,
+            )
+
 
 def postprocess_issues(
-    issues: list[Issue], added_details: dict[str, list[dict[str, Any]]],
+    issues: list[Issue],
+    added_details: dict[str, list[dict[str, Any]]],
+    *,
+    allowlist_entries: list[dict[str, str]] | None = None,
 ) -> list[Issue]:
+    """Post-process model issues.
+
+    If allowlist_entries is provided, use it; otherwise call load_allowlist().
+    Façade may pass entries so tests can patch load_allowlist on the entry module.
+    """
     issues = attach_locations(issues, added_details)
     normalized = [normalize_issue_to_string_value(i) for i in issues]
     recovered = recover_key_prefix_originals(normalized, added_details)
     kept, dropped = filter_userfacing_issues(recovered, already_normalized=True)
-    if dropped:
-        print(f"Filtered {len(dropped)} syntax/non-localization false positive(s)", file=sys.stderr)
+    _log_filtered(dropped, "syntax/non-localization false positive(s)")
     kept, ph_dropped = filter_placeholder_mismatches(kept)
     if ph_dropped:
-        print(
-            f"Filtered {len(ph_dropped)} issue(s) with placeholder mismatch "
+        _log_filtered(
+            ph_dropped,
+            "issue(s) with placeholder mismatch "
             "(suggestion must not add/remove placeholders like %d / {id})",
-            file=sys.stderr,
+            show_samples=True,
         )
-    kept, allow_dropped = filter_allowlisted(kept)
+    entries = allowlist_entries if allowlist_entries is not None else load_allowlist()
+    kept, allow_dropped = filter_allowlisted(kept, entries=entries)
     if allow_dropped:
-        print(f"Filtered {len(allow_dropped)} allowlisted issue(s)", file=sys.stderr)
+        _log_filtered(allow_dropped, "allowlisted issue(s)")
     before = len(kept)
     kept = dedupe_issues(kept)
     if len(kept) < before:

@@ -1,5 +1,8 @@
 """Gemini API client with retry, failover, and quota handling."""
 
+from __future__ import annotations
+
+import re
 import sys
 import time
 from typing import Any
@@ -7,30 +10,34 @@ from typing import Any
 import requests
 
 from config import (
-    GEMINI_MODEL_QUOTAS,
+    DAILY_QUOTA_RE,
     GEMINI_MODELS,
+    GEMINI_MODEL_QUOTAS,
     HTTP_TIMEOUT_SEC,
     MAX_ATTEMPTS,
     MAX_QUOTA_RETRIES,
     QUOTA_RETRY_DEFAULT_SEC,
     RESPONSE_SCHEMA,
-    _COMPLETE_FINISH_REASONS,
+    RETRY_IN_RE,
     gemini_endpoint,
     min_request_interval_sec,
 )
 
-# Global state for model failover
 _active_model_index = 0
+
 
 def reset_model_failover_state() -> None:
     global _active_model_index
     _active_model_index = 0
 
+
 def active_model_quota():
     return GEMINI_MODEL_QUOTAS[_active_model_index]
 
+
 def active_model_id() -> str:
     return active_model_quota().model_id
+
 
 def try_advance_model(reason: str) -> bool:
     global _active_model_index
@@ -45,19 +52,24 @@ def try_advance_model(reason: str) -> bool:
     )
     return True
 
+
 def pace_after_model_failover() -> None:
-    wait = min_request_interval_sec(active_model_quota().rpm)
+    """Wait one full interval for the new model before the next request."""
+    wait = min_request_interval_sec()
     print(
         f"Post-failover pace: sleeping {wait:.1f}s before next request on {active_model_id()}",
         file=sys.stderr,
     )
     time.sleep(wait)
 
+
 def _sleep_transient_backoff(attempt: int) -> None:
     time.sleep(2 ** (attempt - 1))
 
+
 def is_daily_quota_error(body: str) -> bool:
-    return bool(re.search(r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests", body, re.IGNORECASE))
+    return bool(DAILY_QUOTA_RE.search(body or ""))
+
 
 def parse_retry_after_seconds(response: requests.Response) -> float:
     header = response.headers.get("Retry-After") or response.headers.get("retry-after")
@@ -66,12 +78,13 @@ def parse_retry_after_seconds(response: requests.Response) -> float:
             return max(float(header), QUOTA_RETRY_DEFAULT_SEC)
         except ValueError:
             pass
-    if match := re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", response.text or "", re.IGNORECASE):
+    if match := RETRY_IN_RE.search(response.text or ""):
         try:
             return max(float(match.group(1)), 1.0)
         except ValueError:
             pass
     return QUOTA_RETRY_DEFAULT_SEC
+
 
 def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
     """Send prompt to Gemini, return (api_payload, duration_seconds)."""
@@ -112,7 +125,7 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
                     pace_after_model_failover()
                     continue
                 raise RuntimeError(
-                    f"Gemini RPD/daily quota exhausted on all models "
+                    "Gemini RPD/daily quota exhausted on all models "
                     f"({', '.join(GEMINI_MODELS)}) — retry tomorrow or upgrade Usage Tier. "
                     f"Body: {text[:800]}"
                 )

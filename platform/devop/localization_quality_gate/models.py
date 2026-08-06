@@ -1,6 +1,9 @@
 """Data models for the Localization Quality Gate."""
 
+from __future__ import annotations
+
 from typing import Any, TypedDict
+
 
 class Issue(TypedDict, total=False):
     original: str
@@ -14,16 +17,19 @@ class Issue(TypedDict, total=False):
     _recover_original: bool | None
     _key_name: str | None
 
+
 class FileStat(TypedDict):
     path: str
     added: int
     deleted: int
 
+
 class AddedLine(TypedDict):
     line: int
     text: str
 
-class DiffAnalysis(TypedDict):
+
+class DiffAnalysis(TypedDict, total=False):
     review_text: str
     review_by_file: dict[str, str]
     files: list[FileStat]

@@ -1,5 +1,7 @@
 """Format reports: Markdown summary, JSON output, usage lines."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
