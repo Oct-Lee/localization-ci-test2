@@ -1203,10 +1203,16 @@ def test_pace_after_failover_uses_new_model_interval(monkeypatch: pytest.MonkeyP
     sleeps: list[float] = []
     monkeypatch.setattr(gate.time, "sleep", lambda s: sleeps.append(s))
     gate.reset_model_failover_state()
+    # Advance past the two RPM=15 lite models onto an RPM=5 model.
     assert gate.try_advance_model("test")
+    assert gate.try_advance_model("test")
+    assert gate.active_model_quota().rpm == 5
     gate.pace_after_model_failover()
     assert sleeps
-    assert sleeps[-1] == pytest.approx(gate.min_request_interval_sec(), rel=1e-3)
+    assert sleeps[-1] == pytest.approx(
+        gate.min_request_interval_sec(gate.active_model_quota().rpm), rel=1e-3,
+    )
+    assert sleeps[-1] == pytest.approx(12.0, rel=1e-3)
 
 
 def test_assert_generation_complete_rejects_max_tokens():

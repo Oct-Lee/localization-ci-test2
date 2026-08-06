@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import sys
 import time
 from typing import Any
@@ -19,48 +18,73 @@ from config import (
     QUOTA_RETRY_DEFAULT_SEC,
     RESPONSE_SCHEMA,
     RETRY_IN_RE,
+    GeminiModelQuota,
     gemini_endpoint,
     min_request_interval_sec,
 )
 
-_active_model_index = 0
+
+class GeminiFailoverManager:
+    """Sticky model index for quota/availability failover within one process."""
+
+    def __init__(self, quotas: tuple[GeminiModelQuota, ...] = GEMINI_MODEL_QUOTAS) -> None:
+        self._quotas = quotas
+        self._index = 0
+
+    def reset(self) -> None:
+        self._index = 0
+
+    def active_quota(self) -> GeminiModelQuota:
+        return self._quotas[self._index]
+
+    def active_model_id(self) -> str:
+        return self.active_quota().model_id
+
+    def try_advance(self, reason: str) -> bool:
+        if self._index + 1 >= len(self._quotas):
+            return False
+        prev = self._quotas[self._index]
+        self._index += 1
+        nxt = self._quotas[self._index]
+        print(
+            f"Gemini model failover: {prev.model_id} -> {nxt.model_id} "
+            f"(RPM={nxt.rpm}/RPD={nxt.rpd}; {reason})",
+            file=sys.stderr,
+        )
+        return True
+
+    def pace_after_failover(self) -> None:
+        """Wait one full interval for the new model before the next request."""
+        wait = min_request_interval_sec(self.active_quota().rpm)
+        print(
+            f"Post-failover pace: sleeping {wait:.1f}s before next request on "
+            f"{self.active_model_id()}",
+            file=sys.stderr,
+        )
+        time.sleep(wait)
+
+
+_FAILOVER = GeminiFailoverManager()
 
 
 def reset_model_failover_state() -> None:
-    global _active_model_index
-    _active_model_index = 0
+    _FAILOVER.reset()
 
 
-def active_model_quota():
-    return GEMINI_MODEL_QUOTAS[_active_model_index]
+def active_model_quota() -> GeminiModelQuota:
+    return _FAILOVER.active_quota()
 
 
 def active_model_id() -> str:
-    return active_model_quota().model_id
+    return _FAILOVER.active_model_id()
 
 
 def try_advance_model(reason: str) -> bool:
-    global _active_model_index
-    if _active_model_index + 1 >= len(GEMINI_MODEL_QUOTAS):
-        return False
-    prev, _active_model_index = GEMINI_MODEL_QUOTAS[_active_model_index], _active_model_index + 1
-    nxt = GEMINI_MODEL_QUOTAS[_active_model_index]
-    print(
-        f"Gemini model failover: {prev.model_id} -> {nxt.model_id} "
-        f"(RPM={nxt.rpm}/RPD={nxt.rpd}; {reason})",
-        file=sys.stderr,
-    )
-    return True
+    return _FAILOVER.try_advance(reason)
 
 
 def pace_after_model_failover() -> None:
-    """Wait one full interval for the new model before the next request."""
-    wait = min_request_interval_sec()
-    print(
-        f"Post-failover pace: sleeping {wait:.1f}s before next request on {active_model_id()}",
-        file=sys.stderr,
-    )
-    time.sleep(wait)
+    _FAILOVER.pace_after_failover()
 
 
 def _sleep_transient_backoff(attempt: int) -> None:
