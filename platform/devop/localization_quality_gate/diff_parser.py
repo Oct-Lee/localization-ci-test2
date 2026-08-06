@@ -2,9 +2,9 @@
 
 import csv
 import io
+import json
 import re
 from collections import OrderedDict
-from pathlib import Path
 from typing import Any
 
 from config import (
@@ -23,11 +23,11 @@ from config import (
     STRUCT_OPEN_RE,
     _LOCALE_LANG_KEYS,
     _STRUCT_TOKENS,
-    _looks_like_user_facing_locale_key,  # we need to define or import
+    # removed _looks_like_user_facing_locale_key import
 )
-from models import DiffAnalysis, FileStat, AddedLine
+from models import DiffAnalysis
 
-# We need to bring in some helper functions that were in the original script
+# ===== Helper functions =====
 def _json_unescape(value: str) -> str:
     try:
         return json.loads(f'"{value}"')
@@ -43,6 +43,10 @@ def _looks_like_user_facing_locale_key(key: str) -> bool:
     if any(ord(c) > 127 for c in key):
         return True
     return " " in key and not key.startswith("msg.") and "." not in key.split(" ")[0]
+
+def should_skip_review_line(text: str) -> bool:
+    stripped = text.strip()
+    return not stripped or SKIP_LINE_RE.match(stripped) or stripped in _STRUCT_TOKENS
 
 def parse_i18n_csv_row(text: str) -> tuple[str, list[str]] | None:
     try:
@@ -98,14 +102,9 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
             return list(parsed[1])
     return []
 
-def should_skip_review_line(text: str) -> bool:
-    stripped = text.strip()
-    return not stripped or SKIP_LINE_RE.match(stripped) or stripped in _STRUCT_TOKENS
-
 def _peek_multiline_string_value(
     lines: list[str], start_idx: int, *, concatenate: bool = False, max_scan: int | None = None,
 ) -> tuple[list[int], str, int] | None:
-    """Collect following +'...' lines. Returns (skip_indices, concatenated_value, first_value_idx)."""
     skip, parts, first_value_idx = [], [], None
     end = len(lines) if max_scan is None else min(len(lines), start_idx + 1 + max_scan)
     for j in range(start_idx + 1, end):
@@ -178,13 +177,15 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
     review_chunks: list[str] = []
     review_by_file: OrderedDict[str, list[str]] = OrderedDict()
     seen, skip_indices = set(), set()
-    legacy_chunk_chars: list[int] = []   # only for stderr metric, not used in output
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
             files_map[path] = {"path": path, "added": 0, "deleted": 0, "added_lines": []}
             files_order.append(path)
         return files_map[path]
+
+    def _escape_review_value(value: str) -> str:
+        return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
 
     def _compact_review_entry(
         path_label: str,
@@ -199,31 +200,6 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
         header = f"[{path_label}:{line_no}|{key_name}]" if key_name else f"[{path_label}:{line_no}]"
         escaped = [_escape_review_value(v) for v in cleaned]
         return f"{header}\n" + "\\n".join(escaped)
-
-    def _escape_review_value(value: str) -> str:
-        return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
-
-    def _legacy_review_chunk_chars(
-        path_label: str,
-        line_no: int,
-        values: list[str],
-        *,
-        key_name: str | None = None,
-        note: str | None = None,
-        source_line: str | None = None,
-        context_body: str | None = None,
-    ) -> int:
-        parts = [f"# file: {path_label}", f"# line: {line_no}"]
-        if key_name:
-            parts.append(f"# key: {key_name}")
-        if note:
-            parts.append(f"# note: {note}")
-        if source_line is not None:
-            parts.append(source_line if source_line.startswith("+") else f"+{source_line}")
-        if context_body:
-            parts.append(context_body)
-        parts.extend(f"user_facing: {v}" for v in values if v is not None and str(v) != "")
-        return len("\n".join(parts))
 
     for idx, line in enumerate(lines):
         if line.startswith("+++ b/"):
@@ -323,7 +299,6 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
                     continue
                 hints = [stripped]
             chunk = _compact_review_entry(path_label, line_no, hints, key_name=key_name)
-            # Dedupe
             dedupe_key = f"{path_label}:{line_no}:{chunk}"
             if dedupe_key in seen or not chunk:
                 continue
@@ -337,18 +312,12 @@ def analyze_diff(diff_text: str) -> DiffAnalysis:
         if line.startswith(" ") and new_line_no is not None:
             new_line_no += 1
 
-    files_out: list[FileStat] = [
+    files_out = [
         {"path": files_map[p]["path"], "added": files_map[p]["added"], "deleted": files_map[p]["deleted"]}
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}
     review_text = "\n\n".join(review_chunks)
-    # Compute pre/post optimization size (stderr only)
-    sep = 2
-    # We don't have legacy_chunk_chars filled here for all chunks, but we keep for compatibility
-    # Actually we kept it but didn't fill all chunks; we can skip metrics in diff_parser
-    # Or we can compute from review_text length as approximation.
-    # For simplicity, we just output without legacy metric.
     return {
         "review_text": review_text,
         "review_by_file": review_by_file_text,

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import NamedTuple
+import re
 
 # ===== Model Quotas =====
 class GeminiModelQuota(NamedTuple):
@@ -26,18 +27,17 @@ MAX_QUOTA_RETRIES = 5
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 
 # ===== Review batch limits =====
-MAX_REVIEW_CHARS = 100_000          # default batch size
-FOCUSED_TARGET_BATCHES = 2          # target batches for focused files
-PACKED_MAX_CHUNKS_PER_BATCH = 50    # cap chunks per request for large files
+MAX_REVIEW_CHARS = 100_000
+FOCUSED_TARGET_BATCHES = 2
+PACKED_MAX_CHUNKS_PER_BATCH = 50
 SHORT_FILE_MAX_CHUNKS = 40
 SHORT_FILE_MAX_CHARS = 20_000
-CONTEXT_LINES = 1                   # neighbor window for overlap
+CONTEXT_LINES = 1
 
 # ===== File paths =====
 ALLOWLIST_PATH = Path(__file__).resolve().parent / "allowlist.json"
 
 # ===== Focused path regex =====
-import re
 _FOCUSED_PATH_RE = re.compile(
     r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
     r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.|"
@@ -45,7 +45,7 @@ _FOCUSED_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ===== Regular expressions used globally =====
+# ===== Regular expressions =====
 PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|%\w|\$\{[^}]*\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -126,11 +126,6 @@ RESPONSE_SCHEMA: dict[str, any] = {
     "required": ["has_issue", "issues"],
 }
 
-# ===== Utility functions for config =====
+# ===== Endpoint helper (simple) =====
 def gemini_endpoint(model_id: str) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-
-def min_request_interval_sec(rpm: int | None = None) -> float:
-    """Minimum seconds between request starts to approach RPM limit."""
-    limit = rpm if rpm is not None else GEMINI_MODEL_QUOTAS[0].rpm
-    return 60.0 / limit
