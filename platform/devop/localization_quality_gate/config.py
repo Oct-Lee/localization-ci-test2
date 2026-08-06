@@ -14,10 +14,10 @@ class GeminiModelQuota(NamedTuple):
     tpm: int | None = None
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
+    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
-    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
 )
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
