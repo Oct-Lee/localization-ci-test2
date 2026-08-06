@@ -3,6 +3,13 @@ name: Localization Quality Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Git ref to diff against (empty = repository default branch)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -68,9 +75,24 @@ jobs:
             echo "LOCALIZATION_GATE_PATHSPECS is empty" >&2
             exit 1
           fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_REF="${{ inputs.base_ref }}"
+            if [ -z "${BASE_REF}" ]; then
+              BASE_REF="${{ github.event.repository.default_branch }}"
+            fi
+            git fetch origin "${BASE_REF}"
+            BASE_SHA="$(git merge-base "origin/${BASE_REF}" HEAD)"
+            HEAD_SHA="${{ github.sha }}"
+            echo "Manual run: diff ${BASE_SHA} (merge-base of origin/${BASE_REF})...${HEAD_SHA}"
+          fi
+
           git diff \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}" \
+            "${BASE_SHA}" \
+            "${HEAD_SHA}" \
             --unified=0 \
             -- ${LOCALIZATION_GATE_PATHSPECS} \
             > pr.diff
