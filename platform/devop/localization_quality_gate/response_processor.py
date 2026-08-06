@@ -22,14 +22,30 @@ from config import (
     _WS_PROBLEM_RE,
     FENCE_RE,
     PROP_KEY,
+    _COMPLETE_FINISH_REASONS,
 )
 from models import Issue
 
+# ---- Helper functions ----
 def strip_markdown_fence(text: str) -> str:
     stripped = text.strip()
     if m := FENCE_RE.match(stripped):
         return m.group(1).strip()
     return stripped
+
+def extract_response_text(api_payload: dict[str, Any]) -> str:
+    """Extract text from Gemini response payload, ensuring generation complete."""
+    try:
+        candidate = api_payload["candidates"][0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Gemini response has no candidates: {exc}") from exc
+    reason = candidate.get("finishReason") or candidate.get("finish_reason")
+    if reason is not None and reason not in _COMPLETE_FINISH_REASONS:
+        raise ValueError(f"Gemini generation incomplete: finishReason={reason!r}")
+    try:
+        return candidate["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"Unexpected Gemini response shape: {exc}") from exc
 
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
@@ -390,17 +406,13 @@ def recover_key_prefix_originals(
         recovered.append(out)
     return recovered
 
-# Need to import extract_user_facing_hints from diff_parser (circular import avoided by importing inside)
-# We'll import at top after definitions or inside function.
-# To avoid circular, we import at module level but after defining functions.
-# Actually we can import inside _lookup_added_value or at top.
-# Since diff_parser also imports config, it's safe to import from diff_parser here.
+# Need to import extract_user_facing_hints from diff_parser (to avoid circular, import inside functions or at top)
+# We'll import at top after definitions.
 from diff_parser import extract_user_facing_hints  # noqa: E402
 
 def postprocess_issues(
     issues: list[Issue], added_details: dict[str, list[dict[str, Any]]],
 ) -> list[Issue]:
-    """Full postprocessing pipeline."""
     issues = attach_locations(issues, added_details)
     normalized = [normalize_issue_to_string_value(i) for i in issues]
     recovered = recover_key_prefix_originals(normalized, added_details)
