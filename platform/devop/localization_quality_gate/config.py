@@ -126,6 +126,12 @@ RESPONSE_SCHEMA: dict[str, any] = {
     "required": ["has_issue", "issues"],
 }
 
-# ===== Endpoint helper (simple) =====
+# ===== Endpoint helper =====
 def gemini_endpoint(model_id: str) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+
+# ===== Rate limit interval helper =====
+def min_request_interval_sec(rpm: int | None = None) -> float:
+    """Minimum seconds between request starts to approach RPM limit."""
+    limit = rpm if rpm is not None else GEMINI_MODEL_QUOTAS[0].rpm
+    return 60.0 / limit
