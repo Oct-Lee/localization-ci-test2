@@ -1,0 +1,4 @@
+# Dependencies for Gemini Localization Quality Gate CI
+# (.github/workflows/gemini-localization-review.yml)
+requests>=2.31.0,<3
+pytest>=8.0.0,<9

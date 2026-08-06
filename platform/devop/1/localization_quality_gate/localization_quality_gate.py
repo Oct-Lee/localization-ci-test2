@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Gemini Localization Quality Gate — review PR diffs for user-facing text issues.
+"""Localization Quality Gate — review PR diffs for user-facing text issues.
 
-CLI: python scripts/gemini_localization_review.py <diff_file>
+CLI: python platform/devop/localization_quality_gate/localization_quality_gate.py <diff_file>
 Env: GEMINI_API_KEY (required), GITHUB_STEP_SUMMARY (optional)
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
 import sys
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import requests
@@ -26,8 +29,8 @@ class GeminiModelQuota(NamedTuple):
 
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
@@ -37,16 +40,21 @@ HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 MAX_REVIEW_CHARS = 100_000  # default batch size for large EN packs
 # Locale/short files: pack chunks so each file uses about 1–FOCUSED_TARGET_BATCHES API calls.
-FOCUSED_TARGET_BATCHES = 3
+FOCUSED_TARGET_BATCHES = 2
+# Non-focused large files: still cap chunks/request so the model can inspect VALUES.
+PACKED_MAX_CHUNKS_PER_BATCH = 50
 SHORT_FILE_MAX_CHUNKS = 40
 SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
 MAX_QUOTA_RETRIES = 5
 CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused batches
+# Intentional false-positive suppressions (file optional; original exact VALUE match).
+ALLOWLIST_PATH = Path(__file__).resolve().parent / "allowlist.json"
 # Paths that need smaller focused batches for CJK/PT recall.
 _FOCUSED_PATH_RE = re.compile(
     r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
-    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.)",
+    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.|"
+    r"i18n\.csv|(?:^|/)translation$|dimensional/ui/translations\.py)",
     re.IGNORECASE,
 )
 RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
@@ -71,8 +79,13 @@ def active_model_id() -> str:
 
 
 def min_request_interval_sec(rpm: int | None = None) -> float:
+    """Minimum seconds between request *starts* to approach the model RPM limit.
+
+    Pace on start times (not end times) so API latency does not stack on top of
+    the full interval — otherwise effective RPM falls well below the quota.
+    """
     limit = active_model_quota().rpm if rpm is None else rpm
-    return 60.0 / limit + 0.1
+    return 60.0 / limit
 
 
 def gemini_endpoint(model_id: str) -> str:
@@ -110,6 +123,23 @@ KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
 KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
+# Nested object / array openers in TS/JS locale maps — not user-facing VALUES.
+STRUCT_OPEN_RE = re.compile(rf"^\s*{PROP_KEY}\s*:\s*[{{\[]\s*,?\s*$")
+# "outer.key": {  or  "中文键": {  — structure only (unless outer key is user-facing prose).
+QUOTED_KEY_STRUCT_OPEN_RE = re.compile(
+    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{\s*,?\s*$'''
+)
+# Single-line nested locale object: "btn.save": {"en": "Save", "zh": "保存"},
+NESTED_LOCALE_OBJECT_RE = re.compile(
+    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{(?P<body>.*)\}\s*,?\s*$'''
+)
+NESTED_LOCALE_PAIR_RE = re.compile(
+    r'''"(?P<lang>(?:\\.|[^"\\])*)"\s*:\s*"(?P<val>(?:\\.|[^"\\])*)"'''
+)
+_LOCALE_LANG_KEYS = frozenset({
+    "en", "zh", "pt", "en-us", "zh-cn", "pt-pt", "pt-br", "zh-hans", "zh-hant",
+    "english", "chinese", "portuguese",
+})
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
@@ -172,8 +202,10 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
-Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
-Input entries use compact form [file:line] then the VALUE (file/line required for PR annotations).
+Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON;
+i18n CSV (key,zh,en,pt cells); nested locale objects ("key": {{"en": "...", "zh": "..."}}).
+Input entries use compact form [file:line] or [file:line|key] then the VALUE
+(file/line required for PR annotations; |key is optional context).
 Multiline VALUES encode embedded newlines as \\n (one line under the header).
 
 Rules:
@@ -202,23 +234,82 @@ def should_skip_review_line(text: str) -> bool:
     return not stripped or SKIP_LINE_RE.match(stripped) or stripped in _STRUCT_TOKENS
 
 
+def _json_unescape(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except json.JSONDecodeError:
+        return (
+            value.replace(r"\"", '"')
+            .replace(r"\\", "\\")
+            .replace(r"\n", "\n")
+            .replace(r"\t", "\t")
+        )
+
+
+def _looks_like_user_facing_locale_key(key: str) -> bool:
+    """True when an object key is itself display text (e.g. Chinese source string)."""
+    if any(ord(c) > 127 for c in key):
+        return True
+    return " " in key and not key.startswith("msg.") and "." not in key.split(" ")[0]
+
+
+def parse_i18n_csv_row(text: str) -> tuple[str, list[str]] | None:
+    """Parse one i18n CSV row → (key, language VALUES). Skips header / invalid rows."""
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except csv.Error:
+        return None
+    if not rows:
+        return None
+    parts = [p for p in rows[0]]
+    if len(parts) < 2:
+        return None
+    key = parts[0].strip()
+    if not key or key.lower() == "key":
+        return None
+    values = [p for p in parts[1:] if p != ""]
+    if not values:
+        return None
+    return key, values
+
+
+def extract_nested_locale_values(text: str) -> tuple[str, list[str]] | None:
+    """Extract VALUES from "id": {"en": "...", "zh": "..."} / Chinese/English maps."""
+    m = NESTED_LOCALE_OBJECT_RE.match(text.strip())
+    if not m:
+        return None
+    key = _json_unescape(m.group("key"))
+    values: list[str] = []
+    for pm in NESTED_LOCALE_PAIR_RE.finditer(m.group("body")):
+        lang = _json_unescape(pm.group("lang")).lower()
+        if lang in _LOCALE_LANG_KEYS:
+            values.append(_json_unescape(pm.group("val")))
+    if not values:
+        return None
+    return key, values
+
+
 def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
     stripped = text.strip()
     if not stripped or should_skip_review_line(stripped):
         return []
     if m := JSON_KV_RE.match(stripped):
-        return [m.group(2)]
+        return [_json_unescape(m.group(2))]
+    if nested := extract_nested_locale_values(stripped):
+        return nested[1]
     if m := ASSIGNMENT_LINE_RE.match(stripped):
         return [m.group(3)]
     if m := STRING_VALUE_LINE_RE.match(stripped):
         return [m.group(2)]
     lower_path = path.lower()
-    if lower_path.endswith(".csv") or stripped.count(",") >= 2:
-        if stripped.lower().startswith("key,"):
-            return []
-        parts = [p.strip() for p in stripped.split(",")]
-        if len(parts) >= 2 and parts[0]:
-            return [p for p in parts[1:] if p]
+    if lower_path.endswith(".csv") or lower_path.endswith("i18n.csv"):
+        parsed = parse_i18n_csv_row(stripped)
+        return list(parsed[1]) if parsed else []
+    # Heuristic CSV row (no path / unknown): require key-like first cell.
+    if "," in stripped and not stripped.startswith(("'", '"', "{", "[")):
+        parsed = parse_i18n_csv_row(stripped)
+        if parsed:
+            return list(parsed[1])
     return []
 
 
@@ -235,11 +326,20 @@ def _escape_review_value(value: str) -> str:
     )
 
 
-def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> str:
+def _compact_review_entry(
+    path_label: str,
+    line_no: int,
+    values: list[str],
+    *,
+    key_name: str | None = None,
+) -> str:
     """Build one compact review entry for Gemini.
 
     Format (only allowed Gemini review_text shape):
       [file:line]
+      <VALUE>
+    or when key is known (helps key-typo / context without sending source syntax):
+      [file:line|key]
       <VALUE>
 
     Compact Gemini payload format reduces token usage while preserving file/line
@@ -250,62 +350,14 @@ def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> s
     cleaned = [v for v in values if v is not None and str(v) != ""]
     if not cleaned:
         return ""
+    header = (
+        f"[{path_label}:{line_no}|{key_name}]"
+        if key_name
+        else f"[{path_label}:{line_no}]"
+    )
     # Multiple cells (e.g. CSV) join with \\n on one VALUE line — same escape rules.
     escaped = [_escape_review_value(v) for v in cleaned]
-    return f"[{path_label}:{line_no}]\n" + "\\n".join(escaped)
-
-
-def _legacy_review_chunk_chars(
-    path_label: str,
-    line_no: int,
-    values: list[str],
-    *,
-    key_name: str | None = None,
-    note: str | None = None,
-    source_line: str | None = None,
-    context_body: str | None = None,
-) -> int:
-    """Approximate pre-optimization review chunk size (stderr metrics only; not sent)."""
-    parts = [f"# file: {path_label}", f"# line: {line_no}"]
-    if key_name:
-        parts.append(f"# key: {key_name}")
-    if note:
-        parts.append(f"# note: {note}")
-    if source_line is not None:
-        parts.append(source_line if source_line.startswith("+") else f"+{source_line}")
-    if context_body:
-        parts.append(context_body)
-    parts.extend(f"user_facing: {v}" for v in values if v is not None and str(v) != "")
-    return len("\n".join(parts))
-
-
-def _multiline_review_chunk(
-    path_label: str, line_no: int, user_facing_values: list[str], *,
-    key_name: str | None = None, note: str | None = None, source_line: str | None = None,
-) -> str:
-    """Compact multiline VALUE payload (extraction / line tracking unchanged).
-
-    key_name / note / source_line are accepted for call-site compatibility but
-    omitted from the Gemini payload. Newlines inside VALUE are escaped by
-    _compact_review_entry; file+line stay in the compact header for annotations.
-    """
-    _ = (key_name, note, source_line)
-    return _compact_review_entry(path_label, line_no, user_facing_values)
-
-
-def _print_review_text_optimization(before: int, after: int) -> None:
-    """Temporary stderr metric: review_text size before/after compact format."""
-    if before <= 0:
-        reduction = 0.0
-    else:
-        reduction = (before - after) * 100.0 / before
-    print(
-        "Review text optimization:\n"
-        f"before={before} chars\n"
-        f"after={after} chars\n"
-        f"reduction={reduction:.1f}%",
-        file=sys.stderr,
-    )
+    return f"{header}\n" + "\\n".join(escaped)
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -585,6 +637,138 @@ def _peek_triple_quoted_string(
     return None
 
 
+def add_chunk_if_new(
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+    path_label: str,
+    dedupe_key: str,
+    chunk: str,
+) -> bool:
+    """Append a review chunk unless empty or already seen under dedupe_key."""
+    if dedupe_key in seen or not chunk:
+        return False
+    seen.add(dedupe_key)
+    review_chunks.append(chunk)
+    review_by_file.setdefault(path_label, []).append(chunk)
+    return True
+
+
+def process_triple_quote_string(
+    lines: list[str],
+    idx: int,
+    line_no: int,
+    path_label: str,
+    triple: re.Match[str],
+    skip_indices: set[int],
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+) -> bool:
+    """Handle KEY = \"\"\"...\"\"\". Returns True if the opener line was consumed."""
+    merged = _peek_triple_quoted_string(
+        lines, idx, triple.group("q"), triple.group("rest"),
+    )
+    if merged is None:
+        return False
+    skip_idxs, string_val, first_value_idx = merged
+    skip_indices.update(skip_idxs)
+    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+    key_name = triple.group(1)
+    chunk = _compact_review_entry(
+        path_label, value_line_no, [string_val], key_name=key_name,
+    )
+    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+    add_chunk_if_new(
+        seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+    )
+    return True
+
+
+def process_multiline_value(
+    lines: list[str],
+    idx: int,
+    text: str,
+    line_no: int,
+    path_label: str,
+    skip_indices: set[int],
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+) -> str:
+    """Handle KEY: / KEY = ( multiline string openers.
+
+    Returns:
+      "consumed" — opener + value handled (caller should continue)
+      "skip" — opener without a following value (caller should continue)
+      "fallthrough" — not a multiline opener
+    """
+    key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
+    if not (key_only or py_open):
+        return "fallthrough"
+    merged = _peek_multiline_string_value(lines, idx, concatenate=bool(py_open))
+    if not merged:
+        return "skip"
+    skip_idxs, string_val, first_value_idx = merged
+    skip_indices.update(skip_idxs)
+    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+    key_name = (key_only or py_open).group(1)
+    chunk = _compact_review_entry(
+        path_label, value_line_no, [string_val], key_name=key_name,
+    )
+    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+    add_chunk_if_new(
+        seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+    )
+    return "consumed"
+
+
+def extract_user_facing_from_line(
+    text: str, path_label: str,
+) -> tuple[list[str], str | None] | None:
+    """Extract review VALUE hints and optional key from one added line.
+
+    Returns None when the line should be skipped (CSV non-row, non-locale
+    quoted-key struct, or empty unstructured text).
+    """
+    hints: list[str] = []
+    key_name: str | None = None
+    if path_label.lower().endswith(".csv"):
+        if csv_row := parse_i18n_csv_row(text.strip()):
+            # i18n CSV: key,zh-CN,en-US,pt-PT — csv.reader keeps quoted commas intact.
+            key_name, hints = csv_row[0], list(csv_row[1])
+        else:
+            return None  # header / empty / non-row
+    if not hints:
+        if nested := extract_nested_locale_values(text.strip()):
+            key_name, hints = nested[0], list(nested[1])
+    if not hints:
+        if q_open := QUOTED_KEY_STRUCT_OPEN_RE.match(text.strip()):
+            outer_key = _json_unescape(q_open.group("key"))
+            # standard_postprocess/translation uses Chinese prose as object keys.
+            if _looks_like_user_facing_locale_key(outer_key):
+                hints = [outer_key]
+            else:
+                return None
+    if not hints:
+        hints = extract_user_facing_hints(text, path_label)
+        if assign := ASSIGNMENT_LINE_RE.match(text):
+            key_name = assign.group(1)
+        elif jkv := JSON_KV_RE.match(text.strip()):
+            # "Chinese": "…" / "en": "…" — lang label is not the catalog key.
+            lang = _json_unescape(jkv.group(1))
+            if lang.lower() not in _LOCALE_LANG_KEYS:
+                key_name = lang
+    if not hints:
+        # Unstructured added text (no KEY/JSON extract): review the line body
+        # as VALUE — same coverage as the old raw-window path, without metadata.
+        stripped = text.strip()
+        if not stripped:
+            return None
+        hints = [stripped]
+    return hints, key_name
+
+
 def analyze_diff(diff_text: str) -> dict[str, Any]:
     if not diff_text or not diff_text.strip():
         return {"review_text": "", "files": []}
@@ -595,8 +779,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
     review_chunks: list[str] = []
     review_by_file: OrderedDict[str, list[str]] = OrderedDict()
     seen, skip_indices = set(), set()
-    # Pre-optimization size estimate (legacy verbose format) for stderr metrics only.
-    legacy_chunk_chars: list[int] = []
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
@@ -631,96 +813,36 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
             path_label = current_file or "(unknown)"
             if triple := PY_TRIPLE_OPEN_RE.match(text):
-                merged_triple = _peek_triple_quoted_string(
-                    lines, idx, triple.group("q"), triple.group("rest"),
-                )
-                if merged_triple is not None:
-                    skip_idxs, string_val, first_value_idx = merged_triple
-                    skip_indices.update(skip_idxs)
-                    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
-                    key_name = triple.group(1)
-                    source_line = (
-                        f"+  {key_name} = {triple.group('q')}...{triple.group('q')}"
-                    )
-                    note = "python triple-quoted string"
-                    chunk = _multiline_review_chunk(
-                        path_label, value_line_no, [string_val], key_name=key_name,
-                        note=note, source_line=source_line,
-                    )
-                    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                    if dedupe_key not in seen and chunk:
-                        seen.add(dedupe_key)
-                        review_chunks.append(chunk)
-                        review_by_file.setdefault(path_label, []).append(chunk)
-                        legacy_chunk_chars.append(
-                            _legacy_review_chunk_chars(
-                                path_label, value_line_no, [string_val],
-                                key_name=key_name, note=note, source_line=source_line,
-                            )
-                        )
+                if process_triple_quote_string(
+                    lines, idx, line_no, path_label, triple,
+                    skip_indices, seen, review_chunks, review_by_file,
+                ):
                     continue
-            key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
-            merged_value = None
-            if key_only or py_open:
-                merged_value = _peek_multiline_string_value(lines, idx, concatenate=bool(py_open))
-            if (key_only or py_open) and merged_value:
-                skip_idxs, string_val, first_value_idx = merged_value
-                skip_indices.update(skip_idxs)
-                value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
-                key_name = (key_only or py_open).group(1)
-                opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                source_line = f"+  {opener}\n+    {string_val!r}"
-                note = "multiline KEY + string value (valid formatting)"
-                chunk = _multiline_review_chunk(
-                    path_label, value_line_no, [string_val], key_name=key_name,
-                    note=note, source_line=source_line,
-                )
-                dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                if dedupe_key not in seen and chunk:
-                    seen.add(dedupe_key)
-                    review_chunks.append(chunk)
-                    review_by_file.setdefault(path_label, []).append(chunk)
-                    legacy_chunk_chars.append(
-                        _legacy_review_chunk_chars(
-                            path_label, value_line_no, [string_val],
-                            key_name=key_name, note=note, source_line=source_line,
-                        )
-                    )
-                continue
-            if key_only or py_open:
+            multiline = process_multiline_value(
+                lines, idx, text, line_no, path_label,
+                skip_indices, seen, review_chunks, review_by_file,
+            )
+            if multiline in ("consumed", "skip"):
                 continue
             if should_skip_review_line(text):
                 continue
-            hints = extract_user_facing_hints(text, path_label)
-            if not hints:
-                # Unstructured added text (no KEY/JSON extract): review the line body
-                # as VALUE — same coverage as the old raw-window path, without metadata.
-                stripped = text.strip()
-                if not stripped:
-                    continue
-                hints = [stripped]
+            if STRUCT_OPEN_RE.match(text):
+                # Nested map/array openers (e.g. configTool: {) are not VALUES.
+                continue
+            extracted = extract_user_facing_from_line(text, path_label)
+            if extracted is None:
+                continue
+            hints, key_name = extracted
             # CONTEXT_LINES remains 1 for hard-split overlap elsewhere. Neighbor raw
             # diff lines / duplicated peer VALUES are omitted from each entry: they
             # inflated tokens without improving VALUE spelling review once each line
             # already has its own compact [file:line] entry.
-            chunk = _compact_review_entry(path_label, line_no, hints)
-            start = max(0, idx - CONTEXT_LINES)
-            end = min(len(lines), idx + CONTEXT_LINES + 1)
-            window = [
-                lines[j] for j in range(start, end)
-                if not lines[j].startswith(("---", "+++", "@@")) and lines[j].strip()
-            ]
-            legacy_context = "\n".join(window) if window else f"+{text}"
+            chunk = _compact_review_entry(
+                path_label, line_no, hints, key_name=key_name,
+            )
             dedupe_key = f"{path_label}:{line_no}:{chunk}"
-            if dedupe_key in seen or not chunk:
-                continue
-            seen.add(dedupe_key)
-            review_chunks.append(chunk)
-            review_by_file.setdefault(path_label, []).append(chunk)
-            legacy_chunk_chars.append(
-                _legacy_review_chunk_chars(
-                    path_label, line_no, hints, context_body=legacy_context,
-                )
+            add_chunk_if_new(
+                seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
             )
             continue
         if line.startswith("-") and not line.startswith("---"):
@@ -733,13 +855,8 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}
-    review_text = "\n\n".join(review_chunks)
-    sep = 2  # "\n\n" between chunks
-    before = sum(legacy_chunk_chars) + sep * max(0, len(legacy_chunk_chars) - 1)
-    after = len(review_text)
-    _print_review_text_optimization(before, after)
     return {
-        "review_text": review_text,
+        "review_text": "\n\n".join(review_chunks),
         "review_by_file": review_by_file_text,
         "files": files_out,
         "_added_line_details": {p: files_map[p]["added_lines"] for p in files_order},
@@ -886,10 +1003,11 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         validated_issues.append(item)
     if skipped_reasons:
         for reason in skipped_reasons[:10]:
-            print(f"Malformed model issue: {reason}", file=sys.stderr)
-        raise ValueError(
-            f"Dropped {len(skipped_reasons)} malformed issue(s) from model output "
-            "(fail-closed; refusing partial/invalid result)"
+            print(f"Malformed model issue (dropped): {reason}", file=sys.stderr)
+        print(
+            f"Dropped {len(skipped_reasons)} malformed issue(s); "
+            f"keeping {len(validated_issues)} valid issue(s)",
+            file=sys.stderr,
         )
     has_issue = bool(validated_issues)
     if payload["has_issue"] is False and validated_issues:
@@ -916,6 +1034,69 @@ def filter_placeholder_mismatches(
     kept, dropped = [], []
     for issue in issues:
         if placeholders(issue["original"]) != placeholders(issue["suggestion"]):
+            dropped.append(issue)
+        else:
+            kept.append(issue)
+    return kept, dropped
+
+
+def load_allowlist(path: Path | None = None) -> list[dict[str, str]]:
+    """Load allowlist.json: [{"original": "...", "file": "optional/path"}, ...]."""
+    allowlist_path = path if path is not None else ALLOWLIST_PATH
+    if not allowlist_path.is_file():
+        return []
+    try:
+        raw = json.loads(allowlist_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Allowlist ignored (unreadable): {allowlist_path}: {exc}", file=sys.stderr)
+        return []
+    if not isinstance(raw, list):
+        print(f"Allowlist ignored (root must be array): {allowlist_path}", file=sys.stderr)
+        return []
+    entries: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        original = item.get("original")
+        if not isinstance(original, str) or not original:
+            continue
+        entry: dict[str, str] = {"original": original}
+        file_path = item.get("file")
+        if isinstance(file_path, str) and file_path.strip():
+            entry["file"] = file_path.strip().replace("\\", "/")
+        entries.append(entry)
+    return entries
+
+
+def _allowlist_file_match(issue_file: str, allow_file: str) -> bool:
+    issue_file = (issue_file or "").replace("\\", "/")
+    allow_file = allow_file.replace("\\", "/")
+    return issue_file == allow_file or issue_file.endswith("/" + allow_file)
+
+
+def is_allowlisted(issue: dict[str, Any], entries: list[dict[str, str]]) -> bool:
+    original = issue.get("original")
+    if not isinstance(original, str):
+        return False
+    issue_file = str(issue.get("file") or "")
+    for entry in entries:
+        if entry["original"] != original:
+            continue
+        allow_file = entry.get("file")
+        if not allow_file or _allowlist_file_match(issue_file, allow_file):
+            return True
+    return False
+
+
+def filter_allowlisted(
+    issues: list[dict[str, Any]], entries: list[dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    allow = entries if entries is not None else load_allowlist()
+    if not allow:
+        return issues, []
+    kept, dropped = [], []
+    for issue in issues:
+        if is_allowlisted(issue, allow):
             dropped.append(issue)
         else:
             kept.append(issue)
@@ -949,17 +1130,11 @@ def format_step_summary(
         f"- Status: {status}",
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} | Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Token usage: {usage}",
     ]
     if usage_stats:
-        models_s, limits_s = _models_and_limits_text(usage_stats, compact=False)
-        lines.extend([
-            f"- Models: {models_s}",
-            f"- API requests: {usage_stats['requests']} (paced ≥{usage_stats['min_interval_sec']:.1f}s; limits {limits_s})",
-            f"- Tokens: prompt={usage_stats['prompt_tokens']} candidates={usage_stats['candidates_tokens']} total={usage_stats['total_tokens']}",
-            f"- Review payload: sent={usage_stats['chars_sent']} chars, "
-            f"batches={usage_stats['batches']}, files={usage_stats['files_reviewed']}",
-        ])
+        lines.extend(f"- {line}" for line in format_usage_lines(usage_stats))
+    else:
+        lines.append(f"- Token usage: {usage}")
     if extra_note:
         lines.append(f"- Note: {extra_note}")
     lines.extend(["", "### Changed files", ""])
@@ -1134,6 +1309,7 @@ def empty_usage_stats() -> dict[str, Any]:
         "models_used": [], "model_limits": {},
         "rpm_limit": primary.rpm, "tpm_limit": primary.tpm or 0, "rpd_limit": primary.rpd,
         "min_interval_sec": min_request_interval_sec(primary.rpm),
+        "wall_sec": 0.0, "effective_rpm": None,
     }
 
 
@@ -1172,15 +1348,56 @@ def _models_and_limits_text(stats: dict[str, Any], *, compact: bool = False) -> 
     return models_s, limits_s
 
 
+def compute_effective_rpm(
+    request_count: int, first_start: float, last_start: float,
+) -> float | None:
+    """Achieved RPM from request *start* spacing (same basis as pacing).
+
+    Naive ``requests / wall_sec`` over-counts short runs: the gap before the
+    first start is missing, so 2 requests ~4s apart look like ~20+/min.
+    With N≥2 starts, ``(N-1) / span`` matches the paced start rate (≤ limit).
+    """
+    if request_count < 2:
+        return None
+    span = last_start - first_start
+    if span <= 0:
+        return None
+    return (request_count - 1) / (span / 60.0)
+
+
+def format_usage_lines(stats: dict[str, Any]) -> list[str]:
+    """Clear usage lines: effective RPM, RPD this run, total tokens, request scope."""
+    models_s, _ = _models_and_limits_text(stats, compact=False)
+    eff = stats.get("effective_rpm")
+    if isinstance(eff, (int, float)):
+        rpm_s = f"{eff:.1f}/min effective"
+    elif stats.get("requests", 0) < 2:
+        rpm_s = "N/A (<2 requests)"
+    else:
+        rpm_s = "N/A"
+    return [
+        f"RPM: {rpm_s} (limit {stats['rpm_limit']})",
+        f"RPD: {stats['requests']} this run (limit {stats['rpd_limit']})",
+        (
+            f"Tokens: total={stats['total_tokens']} "
+            f"(prompt={stats['prompt_tokens']}, candidates={stats['candidates_tokens']})"
+        ),
+        (
+            f"Requests: {stats['requests']} on {models_s} "
+            f"(pace ≥{stats['min_interval_sec']:.1f}s; batches={stats['batches']}, "
+            f"files={stats['files_reviewed']}, chars={stats['chars_sent']})"
+        ),
+    ]
+
+
 def format_usage_summary(stats: dict[str, Any]) -> str:
-    models_s, limits_s = _models_and_limits_text(stats, compact=True)
-    return (
-        f"requests={stats['requests']} (limits {limits_s}), models={models_s}, "
-        f"prompt_tokens={stats['prompt_tokens']}, candidates_tokens={stats['candidates_tokens']}, "
-        f"total_tokens={stats['total_tokens']}, chars_sent={stats['chars_sent']}, "
-        f"batches={stats['batches']}, "
-        f"files={stats['files_reviewed']}, pace>={stats['min_interval_sec']:.1f}s/req"
-    )
+    return " | ".join(format_usage_lines(stats))
+
+
+def print_usage_summary(stats: dict[str, Any]) -> None:
+    print("Usage:", file=sys.stderr)
+    for line in format_usage_lines(stats):
+        print(f"  {line}", file=sys.stderr)
 
 
 def review_chunks(review_text: str) -> list[str]:
@@ -1199,12 +1416,27 @@ def prefers_focused_batches(path: str, review_text: str) -> bool:
 
 
 def focused_max_chunks_per_batch(chunk_count: int) -> int:
-    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests."""
+    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests.
+
+    Also caps each request at PACKED_MAX_CHUNKS_PER_BATCH so large Chinese/PT
+    files do not reintroduce attention dilution.
+    """
     if chunk_count <= 0:
         return 1
     if chunk_count <= FOCUSED_TARGET_BATCHES:
         return chunk_count  # single request
-    return (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
+    by_target = (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
+    return min(by_target, PACKED_MAX_CHUNKS_PER_BATCH)
+
+
+def max_chunks_per_batch_for_file(path: str, review_text: str) -> int | None:
+    """Choose chunk packing: focused ~1–N batches; large packed files cap per request."""
+    chunks = review_chunks(review_text)
+    if prefers_focused_batches(path, review_text):
+        return focused_max_chunks_per_batch(len(chunks))
+    if len(chunks) > PACKED_MAX_CHUNKS_PER_BATCH:
+        return PACKED_MAX_CHUNKS_PER_BATCH
+    return None
 
 
 def split_into_batches(
@@ -1324,6 +1556,9 @@ def postprocess_issues(
             "(suggestion must not add/remove placeholders like %d / {id})",
             show_samples=True,
         )
+    kept, allow_dropped = filter_allowlisted(kept)
+    if allow_dropped:
+        _log_filtered(allow_dropped, "allowlisted issue(s)")
     before = len(kept)
     kept = dedupe_issues(kept)
     if len(kept) < before:
@@ -1335,20 +1570,22 @@ def review_by_file_sessions(
     api_key: str, review_by_file: dict[str, str],
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
+    wall_t0 = time.monotonic()
+    first_request_at = 0.0
     for path, text in review_by_file.items():
         if not text.strip():
             continue
         focused = prefers_focused_batches(path, text)
-        chunks = review_chunks(text)
-        pack = focused_max_chunks_per_batch(len(chunks)) if focused else None
+        pack = max_chunks_per_batch_for_file(path, text)
         batches = split_into_batches(text, max_chunks_per_batch=pack)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
-        mode = (
-            f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
-            if focused
-            else "packed"
-        )
+        if focused:
+            mode = f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
+        elif pack is not None:
+            mode = f"packed(≤{pack} chunk(s)/req)"
+        else:
+            mode = "packed"
         print(
             f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es), {mode}",
             file=sys.stderr,
@@ -1358,17 +1595,20 @@ def review_by_file_sessions(
             if len(batches) > 1:
                 print(f"  batch {i + 1}/{len(batches)}: {len(batch)} chars", file=sys.stderr)
             quota = active_model_quota()
+            # Pace by request *start* spacing so we can approach the full RPM budget.
             interval = min_request_interval_sec(quota.rpm)
             if last_request_at > 0:
                 wait = interval - (time.monotonic() - last_request_at)
                 if wait > 0:
                     print(
-                        f"  rate-limit pace: sleeping {wait:.1f}s (RPM≤{quota.rpm} on {quota.model_id})",
+                        f"  rate-limit pace: sleeping {wait:.1f}s (target RPM≤{quota.rpm} on {quota.model_id})",
                         file=sys.stderr,
                     )
                     time.sleep(wait)
-            api_payload, duration = call_gemini(api_key, build_prompt(batch))
             last_request_at = time.monotonic()
+            if first_request_at <= 0:
+                first_request_at = last_request_at
+            api_payload, duration = call_gemini(api_key, build_prompt(batch))
             total_duration += duration
             stats["requests"] += 1
             record_model_usage(stats, active_model_quota())
@@ -1382,7 +1622,12 @@ def review_by_file_sessions(
                 if not issue.get("file"):
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
-    print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
+    if stats["requests"] > 0:
+        stats["wall_sec"] = time.monotonic() - wall_t0
+        stats["effective_rpm"] = compute_effective_rpm(
+            stats["requests"], first_request_at, last_request_at,
+        )
+    print_usage_summary(stats)
     return all_issues, total_duration, stats
 
 
@@ -1413,7 +1658,10 @@ def main(argv: list[str] | None = None) -> int:
     reset_model_failover_state()
     args = argv if argv is not None else sys.argv[1:]
     if len(args) != 1:
-        return fail("Usage: python scripts/gemini_localization_review.py <diff_file>")
+        return fail(
+            "Usage: python platform/devop/localization_quality_gate/"
+            "localization_quality_gate.py <diff_file>"
+        )
     try:
         with open(args[0], encoding="utf-8", errors="replace") as handle:
             diff_text = handle.read()

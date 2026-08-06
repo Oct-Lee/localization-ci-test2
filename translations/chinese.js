@@ -1,0 +1,106 @@
+const TranslationsCnst = {
+  form_required: ' *',
+  loading: '载入中 ...',
+  loading_license_check:
+    '如果一直卡在这里，您的license可能不正常。请联系 info@unitxlabs.com',
+  loading_back_to_homepage: '返回首页',
+  loading_back_to_last_page: '返回上一页',
+  refresh: '刷新',
+  no_data: '暂无数据',
+
+  inference_time: '判定用时%s秒',
+
+  auth_error_username_empty: '用户名不能为空',
+  auth_error_password_empty: '密码不能为空',
+  auth_error_with_reason: '登陆失败：',
+  auth_username: '用户名',
+  auth_password: '密码',
+  auth_login: '登陆',
+  password_table_column_edge_machines: '产线机',
+
+  production_report_false_detection_correct: '正确',
+  production_report_false_detection_fr: '过杀',
+  production_report_false_detection_fa: '漏杀',
+  threshold_simulation_fr: '过杀率',
+  threshold_simulation_fa: '漏杀率',
+  threshold_simulation_tip_infos: {
+    hover_info: '查看回测功能使用指南助您快速优化阈值!',
+    header: '欢迎使用阈值模拟功能',
+    feature_1: {
+      title: '功能介绍',
+      content: '帮助用户快速对阈值进行优化和调整，通过对推理结果的再次判定，实现对良率、FA和FR的计算，每次修改阈值请先使用阈值模拟的功能'
+    },
+    feature_2: {
+      title: '使用说明',
+      content_1_1: 'A. 为了快速得到结果，模拟时仅使用 ',
+      content_1_2: '阈值+后处理再次计算良率、FA、FR，该过程没有模型参与',
+      content_2_1: 'B. 良率结果由产线数据计算得出，',
+      content_2_2: '代表着实际的生产情况，',
+      content_2_3: 'FA和FR由质量标准数据集得出，',
+      content_2_4: '代表着客户的质量标准，',
+      content_2_5: '为了得到更加全面的结果，请按照要求添加质量标准数据集',
+      content_3_1: 'C. 阈值模拟界面中 ',
+      content_3_2: '只能针对阈值的数值进行修改，不支持新增和删除阈值条件'
+    },
+    feature_3: {
+      title: '使用建议',
+      content_1_1: '模拟时间控制在 1-3 天，尽量不超过 7 天，',
+      content_1_2: '时间范围大时，模拟耗时多',
+      content_2_1: '每次仅优化一条阈值，并平衡良率、FA和FR，',
+      content_2_2: '得到可接受的结果后，再优化下一条阈值',
+      content_3_1: '调整时建议多使用柱状图的',
+      content_3_2: '功能，',
+      content_3_3: '可以直观查看',
+      content_3_4: '缺陷在产线数据中的数量分布情况，',
+      content_3_5: '请结合柱状图的分布对阈值进行微调'
+    }
+  },
+  image_assigner_label_cc: 'CC',
+  image_information: '图像信息',
+  training_set_ok: '训练集OK',
+  training_set_ng: '训练集NG',
+  validation_set_ok: '验证集OK',
+  validation_set_ng: '验证集NG',
+  no_available_views_for_feature_type: '此物料中没有支持该图像类型的视图。',
+
+  camera_source_camera_only: '仅相机',
+  camera_source_third_party_camera: '第三方相机',
+  camera_source_tcp: 'TCP',
+  view_sequence_mode_two_d: 'CC/2D',
+  view_sequence_mode_min_max: 'Min/Max',
+  view_sequence_mode_two_five_d: '2.5D',
+  all_checked: '全选',
+  no_images_available_tooltip: "由于生产中关闭了图像保存，未保存此物料的原始图像或掩码图像。",
+  no_images_saved_for_part_in_production: "生产中未保存此物料的图像。",
+  part_search_alert:'查询结果为最近',
+  part_search_no_result:'暂无搜索结果',
+  part_search_recent_search:'最近搜索',
+  part_search_view_history:'最近查看',
+  part_search_recent_search_no_result:'暂无搜索记录',
+  part_search_placeholder:'请输入物料ID',
+  part_search_recent_search_3_days:'最近3天',
+  part_search_recent_search_7_days:'最近7天',
+  part_search_recent_search_30_days:'最近30天',
+
+  yes: '是',
+  no: '否',
+  enabled: '启用',
+  disabled: '禁用',
+  invalid_float_error: '必须是有效数字（例如 0.001 或 1e-3）',
+  num_epochs_helper: '完整遍历训练数据集的次数，大于或等于 2 的整数。',
+  hyper_parameters: '超参数',
+  num_epochs: '训练轮数',
+  learning_rate: '学习率',
+  label_smoothing: '标签平滑',
+  warmup_pct_default: '热身百分比',
+  warmdown_start_pct: '冷却开始百分比',
+  weight_decay: '权重衰减',
+  reset_hyperparameters: '重置超参数',
+
+  validation_invalid_number: '请输入有效的数字',
+  validation_must_be_integer: '必须为整数',
+  validation_greater_than_one_required: '必须大于1',
+};
+
+export default TranslationsCnst;
+

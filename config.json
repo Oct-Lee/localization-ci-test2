@@ -1,0 +1,17 @@
+{
+    "base_path": "/home/unitx/unitx_data/data/production/output",
+    "image_size": 18000,
+    "total_images": 190,
+    "time_limit": 21,
+    "repeat_times": 500,
+    "round_interval": 2,
+    "image_format": "PNG",
+    "image_quality": 100,
+    "use_threading": false,
+    "max_workers": 1,
+    "secondary_enabled": true,
+    "secondary_base_path": "/home/unitx/shared_data",
+    "secondary_image_size": 400,
+    "secondary_image_format": "JPEG",
+    "secondary_quality": 100
+}

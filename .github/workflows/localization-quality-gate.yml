@@ -1,0 +1,124 @@
+name: Localization Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Git ref to diff against (empty = repository default branch)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  localization-review:
+    name: Localization Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # ===== SINGLE SOURCE OF TRUTH: edit path scope ONLY here =====
+      # Based on monorepo user-facing i18n inventory (locales / translations* / i18n).
+      # Do NOT include vendor paths (select2, vditor, erupt framework, *.so).
+      LOCALIZATION_GATE_PATHSPECS: >-
+        apps/optix/ui/locales/lang
+        apps/optix/ui/app/translations
+        apps/central/central_web/src/locales/lang
+        apps/central_client/src/locales/lang
+        apps/digix_client/digix_client_ui/src/locales/lang
+        apps/digix_client/digix_client_src/translations
+        apps/report_tool/web/src/i18n/locales
+        apps/cortex/ui/app/translations
+        apps/smart-camera/frontend/src/i18n
+        apps/production/production_src/translations_prod
+        platform/boot_check/translations
+        platform/upgrade_agent/app/i18n
+        packages/standard_postprocess/translation
+        packages/vision_engine/unitxvisionengine/dimensional/ui/translations.py
+        :(glob)**/i18n.csv
+        :(glob)apps/x/**/resources/i18n/**
+        :(glob)**/translations_optix/**
+        :(glob)**/translations_backend/**
+        :(glob)**/translations_prod/**
+        :(glob)shared/config/**/translations/**
+        :(glob)**/translations*/english.py
+        :(glob)**/translations*/chinese.py
+        :(glob)**/translations*/portuguese.py
+        :(glob)**/translations*/english.js
+        :(glob)**/translations*/chinese.js
+        :(glob)**/translations*/portuguese.js
+        :(glob)**/locales/lang/english.ts
+        :(glob)**/locales/lang/chinese.ts
+        :(glob)**/locales/lang/portuguese.ts
+      # ===== end pathspecs =====
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR changed lines in scope
+        id: scoped_diff
+        run: |
+          set -euo pipefail
+          if [ -z "${LOCALIZATION_GATE_PATHSPECS// }" ]; then
+            echo "LOCALIZATION_GATE_PATHSPECS is empty" >&2
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_REF="${{ inputs.base_ref }}"
+            if [ -z "${BASE_REF}" ]; then
+              BASE_REF="${{ github.event.repository.default_branch }}"
+            fi
+            git fetch origin "${BASE_REF}"
+            BASE_SHA="$(git merge-base "origin/${BASE_REF}" HEAD)"
+            HEAD_SHA="${{ github.sha }}"
+            echo "Manual run: diff ${BASE_SHA} (merge-base of origin/${BASE_REF})...${HEAD_SHA}"
+          fi
+
+          git diff \
+            "${BASE_SHA}" \
+            "${HEAD_SHA}" \
+            --unified=0 \
+            -- ${LOCALIZATION_GATE_PATHSPECS} \
+            > pr.diff
+
+          if [ ! -s pr.diff ]; then
+            echo "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API"
+            echo "in_scope=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "in_scope=true" >> "$GITHUB_OUTPUT"
+          echo "=== pr.diff (first 200 lines) ==="
+          head -n 200 pr.diff || true
+
+      - name: Set up Python
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        run: |
+          python -c "import requests" 2>/dev/null \
+            || python -m pip install "requests>=2.31.0,<3"
+
+      - name: Run localization quality gate
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        run: python platform/devop/localization_quality_gate/localization_quality_gate.py pr.diff

@@ -35,20 +35,9 @@ GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
 HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
-MAX_REVIEW_CHARS = 100_000  # default batch size for large EN packs
-# Locale/short files: pack chunks so each file uses about 1–FOCUSED_TARGET_BATCHES API calls.
-FOCUSED_TARGET_BATCHES = 3
-SHORT_FILE_MAX_CHUNKS = 40
-SHORT_FILE_MAX_CHARS = 20_000
+MAX_REVIEW_CHARS = 100_000  # 0803-proven batch size; pair with ±CONTEXT_LINES overlap for recall
 QUOTA_RETRY_DEFAULT_SEC = 60.0
-MAX_QUOTA_RETRIES = 5
-CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused batches
-# Paths that need smaller focused batches for CJK/PT recall.
-_FOCUSED_PATH_RE = re.compile(
-    r"(?:chinese|portuguese|brazil|/zh(?:[-_/]|$)|_zh\.|zh_cn|zh-cn|zh_hans|"
-    r"pt_br|pt-br|/pt(?:[-_/]|$)|_pt\.)",
-    re.IGNORECASE,
-)
+MAX_QUOTA_RETRIES = 40
 RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
 DAILY_QUOTA_RE = re.compile(
     r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
@@ -103,20 +92,18 @@ def pace_after_model_failover() -> None:
     time.sleep(wait)
 
 
-PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|%\w|\$\{[^}]*\}")
+CONTEXT_LINES = 3
+PLACEHOLDER_RE = re.compile(r"\{[^}]+\}|%\w|\$\{[^}]+\}")
 FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
-KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
+KEY_ASSIGN_PREFIX_RE = re.compile(rf"^({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
-# Match quoted VALUE lines; honor escapes so \" / \' do not end the string early.
-STRING_VALUE_LINE_RE = re.compile(
-    r"""^\s*(['"])((?:\\.|(?!\1)[^\r\n])*)\1\s*,?\s*$"""
-)
+STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])(.*)\1\s*,?\s*$""")
 ASSIGNMENT_LINE_RE = re.compile(rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""", re.DOTALL)
 JSON_KV_RE = re.compile(r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$""")
 SKIP_LINE_RE = re.compile(
@@ -131,7 +118,6 @@ SYNTAX_PROBLEM_RE = re.compile(
 )
 SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW = "high", "medium", "low"
 VALID_SEVERITIES = {SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW}
-_SEVERITY_RANK = {SEVERITY_HIGH: 3, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 1}
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
 _ID_PROBLEM_TOKENS = (
@@ -166,31 +152,133 @@ RESPONSE_SCHEMA: dict[str, Any] = {
     },
     "required": ["has_issue", "issues"],
 }
-
-
-# Task brief. Severity/FP also enforced in postprocess + responseSchema.
+# Full task brief + examples. Severity / FP enforcement also run in postprocess + responseSchema.
 def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
-Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
-Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
-Input entries use compact form [file:line] then the VALUE (file/line required for PR annotations).
-Multiline VALUES encode embedded newlines as \\n (one line under the header).
+
+Review ONLY user-facing string VALUES in the PR changes below
+(English / Simplified Chinese / Portuguese).
+
+Monorepo formats you will see:
+- JS/TS object:  auth_login: 'LOG IN'   |  title: 'ComX Config'
+- JS/TS multiline (VALID):  loading_license_check:\\n  'long text'
+- Python:  ERROR_X = "..."   |  ERROR_X = (\\n    "..."\\n)
+- JSON:  "confirm": "Confirm"
+- CSV:  key,zh-CN,en-US,pt-PT  — review language cell VALUES, not the key column
+When a line is annotated with "user_facing: ...", review that text first.
 
 Rules:
-1) original/suggestion = VALUE only — never whole KEY lines or bare "KEY =" / "KEY:".
-2) Identifier/key typos MAY be reported at severity "low" only.
-3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
-4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
-5) Leading/trailing whitespace style → severity "low" only (never high/medium).
-6) Inspect EVERY VALUE carefully (character-level spelling/grammar/wrong words,
-   including Chinese character mistakes, wrong characters, and incorrect word usage).
-   Do not skip entries.
-Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
+1) Primary focus: quoted string VALUES (user-facing text).
+   For value issues, "original" / "suggestion" MUST be ONLY the string value,
+   NOT the whole "KEY: 'value'" / 'KEY = "value"' line, and NOT a bare
+   "KEY =" / "KEY:" prefix.
+2) Constant / object-key / identifier names (e.g. FLEX_LIGNT_CONTROL_TITLE,
+   cencel, dictionries): MAY be reported when misspelled, but severity MUST be
+   "low" (never high/medium). These do NOT block merge.
+3) MUST IGNORE code syntax / structure problems:
+   missing/extra commas, colons, braces, quotes around keys, JSON/JS/TS/Python syntax.
+4) Multiline key/value split is VALID. Never report "missing comma" / "incomplete
+   statement" just because the value is on the next line after "KEY_NAME:".
+   Review the following quoted value instead.
+5) Placeholders {{...}}, %s / %d / %w, ${{...}}, and Python {{}} / str.format
+   fields MUST remain identical in suggestions. NEVER invent placeholders that
+   are absent from original (e.g. do not turn "个物料模拟失败:" into
+   "%d个物料模拟失败"). NEVER remove existing placeholders.
+6) Leading / trailing whitespace style in VALUES (e.g. intentional leading space
+   for layout) MAY be reported but severity MUST be "low" (never high/medium).
 
-Severity (lowercase): high = VALUE spelling/grammar/wrong word; medium = wording;
-low = VALUE casing/whitespace style OR identifier/key typos. Only high blocks merge.
+Also ignore: imports, export wrappers, URLs, paths, UUIDs, hashes, debug-only
+messages, internal comments, vendor/framework glue.
 
-Return JSON only (schema enforced by API). Empty → {{"has_issue": false, "issues": []}}.
+Good examples:
+  Input: FILE_CAMERA_NOT_SELECT: 'File Camera not select',
+  → original: "File Camera not select"
+    suggestion: "File Camera not selected"
+    severity: "high"
+
+  Input (multiline — valid):
+    COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE:
+      'Please save the changes to the Sequence first',
+  → review only: "Please save the changes to the Sequence first"
+  → DO NOT flag the key line as missing comma / incomplete syntax
+
+  Input: ERROR_CANNOT_FIND_CAMERA = "Cannot find camera {{}}. Pleace check..."
+  → original: "Cannot find camera {{}}. Pleace check..."
+    suggestion: "Cannot find camera {{}}. Please check..."
+    severity: "high"
+
+  Input: FLEX_LIGNT_CONTROL_TITLE: 'Brightness control',
+  → original: "FLEX_LIGNT_CONTROL_TITLE"
+    suggestion: "FLEX_LIGHT_CONTROL_TITLE"
+    problem: "Identifier spelling: LIGNT → LIGHT"
+    severity: "low"
+
+  Input: cencel: 'Cencel',
+  → may emit TWO issues:
+      value: original "Cencel" → "Cancel" (high)
+      key: original "cencel" → "cancel" (low)
+
+  Input (Chinese typo with placeholder):
+    TRAINING_QUEUE_MSG: '已经加入训练序列，前面还有%d个神经网路'
+  → original: "已经加入训练序列，前面还有%d个神经网路"
+    suggestion: "已经加入训练序列，前面还有%d个神经网络"
+    problem: "Typo: 神经网路 should be 神经网络"
+    severity: "high"
+  → Note placeholder %d is preserved unchanged.
+
+  Input (leading space — style only):
+    LIMIT_NORMAL_DEFECT_REASON = " {{}}【判定条件】导致图像LIMIT。"
+  → original: " {{}}【判定条件】导致图像LIMIT。"
+    suggestion: "{{}}【判定条件】导致图像LIMIT。"
+    severity: "low"
+  → DO NOT put "LIMIT_NORMAL_DEFECT_REASON =" into original.
+  → DO NOT mark leading/trailing whitespace as high.
+
+Bad examples (DO NOT emit):
+  - Flagging COMPUTATIONAL_IMAGING_UNSAVED_SEQUENCE: as "missing comma" because
+    the string value is on the next line
+  - Marking identifier/key typos as high/medium
+  - Putting "KEY: 'value'" or bare "KEY =" into original for a value-only fix
+  - Marking leading/trailing whitespace as high/medium
+
+Casing / word-form rules (critical):
+- Fix the word itself; do NOT introduce incorrect capitalization.
+- Mid-sentence English words stay lowercase unless they are proper nouns or
+  the start of a sentence.
+- Example: "not Founded" → suggestion MUST be "not found"
+  (past participle of "find"). NEVER suggest "Found" or "not Found".
+- Example: "configration" → "configuration" (keep surrounding casing unchanged).
+- Use English comma "," in English sentences; do not keep Chinese "，" inside
+  English text when that is part of the error.
+
+Severity rules (severity values MUST be lowercase):
+- HIGH: Spelling, Grammar, Incorrect Word Usage, or Localization errors that
+  seriously hurt understanding in user-facing VALUES. ALL spelling / grammar /
+  incorrect word usage in VALUES MUST be "high".
+- MEDIUM: Wording / Readability / consistency improvements of VALUES
+- LOW: Capitalization / optional style of VALUES (including leading/trailing
+  whitespace), AND any constant-name / identifier / object-key spelling issues.
+  Capitalization, whitespace-style, and identifier issues MUST be "low".
+
+Blocking rule: only "high" severity blocks merge.
+
+Return JSON ONLY. No markdown fences. No prose outside JSON.
+Schema:
+{{
+  "has_issue": boolean,
+  "issues": [
+    {{
+      "file": string,
+      "line": number,
+      "original": string,
+      "problem": string,
+      "suggestion": string,
+      "severity": "high" | "medium" | "low"
+    }}
+  ]
+}}
+If no issues: {{"has_issue": false, "issues": []}}
+If issues is non-empty, has_issue must be true.
 
 PR changes to review:
 {review_text}
@@ -222,50 +310,10 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
     return []
 
 
-def _escape_review_value(value: str) -> str:
-    """Escape embedded newlines in a VALUE for compact Gemini payload.
-
-    Normalize CRLF/CR to the two-character sequence \\n so a multiline VALUE stays
-    one physical line under [file:line] and is not read as another entry.
-    """
-    return (
-        value.replace("\r\n", "\\n")
-        .replace("\r", "\\n")
-        .replace("\n", "\\n")
-    )
-
-
-def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> str:
-    """Build one compact review entry for Gemini.
-
-    Format (only allowed Gemini review_text shape):
-      [file:line]
-      <VALUE>
-
-    Compact Gemini payload format reduces token usage while preserving file/line
-    mapping required for PR annotations. Legacy verbose labels (# file / # line /
-    user_facing: / source syntax) are intentionally omitted. Multiline VALUES use
-    \\n escapes so only the header line carries structure.
-    """
-    cleaned = [v for v in values if v is not None and str(v) != ""]
-    if not cleaned:
-        return ""
-    # Multiple cells (e.g. CSV) join with \\n on one VALUE line — same escape rules.
-    escaped = [_escape_review_value(v) for v in cleaned]
-    return f"[{path_label}:{line_no}]\n" + "\\n".join(escaped)
-
-
-def _legacy_review_chunk_chars(
-    path_label: str,
-    line_no: int,
-    values: list[str],
-    *,
-    key_name: str | None = None,
-    note: str | None = None,
-    source_line: str | None = None,
-    context_body: str | None = None,
-) -> int:
-    """Approximate pre-optimization review chunk size (stderr metrics only; not sent)."""
+def _multiline_review_chunk(
+    path_label: str, line_no: int, user_facing_values: list[str], *,
+    key_name: str | None = None, note: str | None = None, source_line: str | None = None,
+) -> str:
     parts = [f"# file: {path_label}", f"# line: {line_no}"]
     if key_name:
         parts.append(f"# key: {key_name}")
@@ -273,39 +321,8 @@ def _legacy_review_chunk_chars(
         parts.append(f"# note: {note}")
     if source_line is not None:
         parts.append(source_line if source_line.startswith("+") else f"+{source_line}")
-    if context_body:
-        parts.append(context_body)
-    parts.extend(f"user_facing: {v}" for v in values if v is not None and str(v) != "")
-    return len("\n".join(parts))
-
-
-def _multiline_review_chunk(
-    path_label: str, line_no: int, user_facing_values: list[str], *,
-    key_name: str | None = None, note: str | None = None, source_line: str | None = None,
-) -> str:
-    """Compact multiline VALUE payload (extraction / line tracking unchanged).
-
-    key_name / note / source_line are accepted for call-site compatibility but
-    omitted from the Gemini payload. Newlines inside VALUE are escaped by
-    _compact_review_entry; file+line stay in the compact header for annotations.
-    """
-    _ = (key_name, note, source_line)
-    return _compact_review_entry(path_label, line_no, user_facing_values)
-
-
-def _print_review_text_optimization(before: int, after: int) -> None:
-    """Temporary stderr metric: review_text size before/after compact format."""
-    if before <= 0:
-        reduction = 0.0
-    else:
-        reduction = (before - after) * 100.0 / before
-    print(
-        "Review text optimization:\n"
-        f"before={before} chars\n"
-        f"after={after} chars\n"
-        f"reduction={reduction:.1f}%",
-        file=sys.stderr,
-    )
+    parts.extend(f"user_facing: {v}" for v in user_facing_values)
+    return "\n".join(parts)
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -338,10 +355,8 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
     out = dict(issue)
     original_raw = out.get("original", "")
     suggestion_raw = out.get("suggestion", "")
-    # Do not .strip() before matching: VALUE leading/trailing whitespace is meaningful
-    # (forced to low later). Assignment / key-prefix patterns already allow ^\\s*.
-    o_m = ASSIGNMENT_LINE_RE.match(original_raw)
-    s_m = ASSIGNMENT_LINE_RE.match(suggestion_raw)
+    original, suggestion = original_raw.strip(), suggestion_raw.strip()
+    o_m, s_m = ASSIGNMENT_LINE_RE.match(original), ASSIGNMENT_LINE_RE.match(suggestion)
     if o_m and s_m:
         if o_m.group(1) != s_m.group(1):
             out.update(original=o_m.group(1), suggestion=s_m.group(1), _kind="identifier")
@@ -354,10 +369,10 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
             out["suggestion"] = suggestion_raw
         return out
     # Model sometimes emits bare "KEY =" / "KEY:" instead of the quoted VALUE.
-    if m := KEY_ASSIGN_PREFIX_RE.match(original_raw):
+    if KEY_ASSIGN_PREFIX_RE.match(original):
         out["_recover_original"] = True
-        out["_key_name"] = m.group(1)
-        if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion_raw):
+        out["_key_name"] = KEY_ASSIGN_PREFIX_RE.match(original).group(1)
+        if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion):
             out["suggestion"] = suggestion_raw
         return out
     # Keep raw strings so intentional leading spaces are not stripped away.
@@ -484,13 +499,11 @@ def recover_key_prefix_originals(
     return recovered
 
 
-def filter_userfacing_issues(
-    issues: list[dict[str, Any]], *, already_normalized: bool = False,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def filter_userfacing_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Drop syntax FPs; force identifier / whitespace-style findings to low."""
     kept, dropped = [], []
     for issue in issues:
-        normalized = issue if already_normalized else normalize_issue_to_string_value(issue)
+        normalized = normalize_issue_to_string_value(issue)
         if is_syntax_false_positive(normalized):
             dropped.append(issue)
             continue
@@ -500,6 +513,7 @@ def filter_userfacing_issues(
             continue
         if is_identifier_issue(normalized) or is_whitespace_style_issue(normalized):
             normalized["severity"] = SEVERITY_LOW
+        normalized.pop("_invalid", None)
         normalized.pop("_kind", None)
         normalized.pop("_recover_original", None)
         normalized.pop("_key_name", None)
@@ -595,8 +609,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
     review_chunks: list[str] = []
     review_by_file: OrderedDict[str, list[str]] = OrderedDict()
     seen, skip_indices = set(), set()
-    # Pre-optimization size estimate (legacy verbose format) for stderr metrics only.
-    legacy_chunk_chars: list[int] = []
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
@@ -639,25 +651,16 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                     skip_indices.update(skip_idxs)
                     value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
                     key_name = triple.group(1)
-                    source_line = (
-                        f"+  {key_name} = {triple.group('q')}...{triple.group('q')}"
-                    )
-                    note = "python triple-quoted string"
                     chunk = _multiline_review_chunk(
                         path_label, value_line_no, [string_val], key_name=key_name,
-                        note=note, source_line=source_line,
+                        note="python triple-quoted string",
+                        source_line=f"+  {key_name} = {triple.group('q')}...{triple.group('q')}",
                     )
                     dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                    if dedupe_key not in seen and chunk:
+                    if dedupe_key not in seen:
                         seen.add(dedupe_key)
                         review_chunks.append(chunk)
                         review_by_file.setdefault(path_label, []).append(chunk)
-                        legacy_chunk_chars.append(
-                            _legacy_review_chunk_chars(
-                                path_label, value_line_no, [string_val],
-                                key_name=key_name, note=note, source_line=source_line,
-                            )
-                        )
                     continue
             key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
             merged_value = None
@@ -669,59 +672,40 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
                 key_name = (key_only or py_open).group(1)
                 opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                source_line = f"+  {opener}\n+    {string_val!r}"
-                note = "multiline KEY + string value (valid formatting)"
                 chunk = _multiline_review_chunk(
                     path_label, value_line_no, [string_val], key_name=key_name,
-                    note=note, source_line=source_line,
+                    note="multiline KEY + string value (valid formatting)",
+                    source_line=f"+  {opener}\n+    {string_val!r}",
                 )
                 dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                if dedupe_key not in seen and chunk:
+                if dedupe_key not in seen:
                     seen.add(dedupe_key)
                     review_chunks.append(chunk)
                     review_by_file.setdefault(path_label, []).append(chunk)
-                    legacy_chunk_chars.append(
-                        _legacy_review_chunk_chars(
-                            path_label, value_line_no, [string_val],
-                            key_name=key_name, note=note, source_line=source_line,
-                        )
-                    )
                 continue
             if key_only or py_open:
                 continue
             if should_skip_review_line(text):
                 continue
             hints = extract_user_facing_hints(text, path_label)
-            if not hints:
-                # Unstructured added text (no KEY/JSON extract): review the line body
-                # as VALUE — same coverage as the old raw-window path, without metadata.
-                stripped = text.strip()
-                if not stripped:
-                    continue
-                hints = [stripped]
-            # CONTEXT_LINES remains 1 for hard-split overlap elsewhere. Neighbor raw
-            # diff lines / duplicated peer VALUES are omitted from each entry: they
-            # inflated tokens without improving VALUE spelling review once each line
-            # already has its own compact [file:line] entry.
-            chunk = _compact_review_entry(path_label, line_no, hints)
-            start = max(0, idx - CONTEXT_LINES)
-            end = min(len(lines), idx + CONTEXT_LINES + 1)
+            # Keep ±CONTEXT_LINES neighbors (same as 0803): overlapping windows improve Chinese recall.
+            start, end = max(0, idx - CONTEXT_LINES), min(len(lines), idx + CONTEXT_LINES + 1)
             window = [
                 lines[j] for j in range(start, end)
-                if not lines[j].startswith(("---", "+++", "@@")) and lines[j].strip()
+                if not lines[j].startswith(("---", "+++", "@@"))
             ]
-            legacy_context = "\n".join(window) if window else f"+{text}"
-            dedupe_key = f"{path_label}:{line_no}:{chunk}"
-            if dedupe_key in seen or not chunk:
+            if not window and not hints:
+                continue
+            body = "\n".join(window) if window else f"+{text}"
+            if hints:
+                body += "\n" + "\n".join(f"user_facing: {h}" for h in hints)
+            dedupe_key = f"{path_label}:{line_no}:{body}"
+            if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
+            chunk = f"# file: {path_label}\n# line: {line_no}\n{body}"
             review_chunks.append(chunk)
             review_by_file.setdefault(path_label, []).append(chunk)
-            legacy_chunk_chars.append(
-                _legacy_review_chunk_chars(
-                    path_label, line_no, hints, context_body=legacy_context,
-                )
-            )
             continue
         if line.startswith("-") and not line.startswith("---"):
             ensure_file(current_file or "(unknown)")["deleted"] += 1
@@ -733,13 +717,8 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}
-    review_text = "\n\n".join(review_chunks)
-    sep = 2  # "\n\n" between chunks
-    before = sum(legacy_chunk_chars) + sep * max(0, len(legacy_chunk_chars) - 1)
-    after = len(review_text)
-    _print_review_text_optimization(before, after)
     return {
-        "review_text": review_text,
+        "review_text": "\n\n".join(review_chunks),
         "review_by_file": review_by_file_text,
         "files": files_out,
         "_added_line_details": {p: files_map[p]["added_lines"] for p in files_order},
@@ -779,8 +758,7 @@ def attach_locations(
     enriched = []
     for issue in issues:
         out = dict(issue)
-        raw = out.get("original") or ""
-        needle = raw.strip()
+        needle = (out.get("original") or "").strip()
         if not needle:
             enriched.append(out)
             continue
@@ -793,8 +771,7 @@ def attach_locations(
             for row in added_details.get(path, []):
                 text = row["text"]
                 hit = (path, row["line"])
-                # Prefer exact VALUE match including intentional leading spaces.
-                if _value_exact_in_line(raw, text) or _value_exact_in_line(needle, text):
+                if _value_exact_in_line(needle, text):
                     exact.append(hit)
                 elif f'"{needle}"' in text or f"'{needle}'" in text:
                     soft.append(hit)
@@ -809,9 +786,7 @@ def attach_locations(
 
 def strip_markdown_fence(text: str) -> str:
     stripped = text.strip()
-    if m := FENCE_RE.match(stripped):
-        return m.group(1).strip()
-    return stripped
+    return FENCE_RE.match(stripped).group(1).strip() if FENCE_RE.match(stripped) else stripped
 
 
 def extract_response_text(api_payload: dict[str, Any]) -> str:
@@ -868,12 +843,10 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         if severity not in VALID_SEVERITIES:
             skipped_reasons.append(f"issues[{i}]: invalid severity {issue['severity']!r}")
             continue
-        # Preserve VALUE whitespace (leading/trailing spaces may be intentional).
-        # Only trim problem text; emptiness already validated via .strip() above.
         item: dict[str, Any] = {
-            "original": issue["original"],
+            "original": issue["original"].strip(),
             "problem": issue["problem"].strip(),
-            "suggestion": issue["suggestion"],
+            "suggestion": issue["suggestion"].strip(),
             "severity": severity,
         }
         if isinstance(issue.get("file"), str) and issue["file"].strip():
@@ -1031,14 +1004,13 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             "responseSchema": RESPONSE_SCHEMA,
         },
     }
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     start = time.monotonic()
     quota_retries = transient_attempts = 0
     while True:
         model_id = active_model_id()
-        url = gemini_endpoint(model_id)
+        url = f"{gemini_endpoint(model_id)}?key={api_key}"
         try:
-            response = requests.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT_SEC)
+            response = requests.post(url, json=body, timeout=HTTP_TIMEOUT_SEC)
         except requests.Timeout as exc:
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
@@ -1085,21 +1057,9 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
         if response.status_code in (500, 503):
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
-                if try_advance_model(
-                    f"HTTP {response.status_code} after {MAX_ATTEMPTS} attempts on {model_id}"
-                ):
-                    quota_retries = transient_attempts = 0
-                    pace_after_model_failover()
-                    continue
                 raise RuntimeError(
-                    f"Gemini API failed with HTTP {response.status_code} on all models "
-                    f"({', '.join(GEMINI_MODELS)}): {response.text[:1000]}"
+                    f"Gemini API failed with HTTP {response.status_code}: {response.text[:1000]}"
                 )
-            print(
-                f"HTTP {response.status_code} on {model_id}. "
-                f"Retry {transient_attempts}/{MAX_ATTEMPTS} then failover if still failing",
-                file=sys.stderr,
-            )
             _sleep_transient_backoff(transient_attempts)
             continue
         raise RuntimeError(
@@ -1183,46 +1143,15 @@ def format_usage_summary(stats: dict[str, Any]) -> str:
     )
 
 
-def review_chunks(review_text: str) -> list[str]:
-    return [c for c in review_text.split("\n\n") if c.strip()]
-
-
-def prefers_focused_batches(path: str, review_text: str) -> bool:
-    """Chinese/PT locale paths, or short files: use ~1–FOCUSED_TARGET_BATCHES requests."""
-    if _FOCUSED_PATH_RE.search(path or ""):
-        return True
-    chunks = review_chunks(review_text)
-    return (
-        0 < len(chunks) <= SHORT_FILE_MAX_CHUNKS
-        and len(review_text) <= SHORT_FILE_MAX_CHARS
-    )
-
-
-def focused_max_chunks_per_batch(chunk_count: int) -> int:
-    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests."""
-    if chunk_count <= 0:
-        return 1
-    if chunk_count <= FOCUSED_TARGET_BATCHES:
-        return chunk_count  # single request
-    return (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
-
-
-def split_into_batches(
-    review_text: str,
-    limit: int | None = None,
-    *,
-    max_chunks_per_batch: int | None = None,
-) -> list[str]:
+def split_into_batches(review_text: str, limit: int | None = None) -> list[str]:
     """Pack whole review chunks (\\n\\n-separated). Only hard-split a chunk if it alone exceeds limit."""
     if limit is None:
         limit = MAX_REVIEW_CHARS
     if not review_text.strip():
         return []
-    chunks = review_chunks(review_text)
+    chunks = [c for c in review_text.split("\n\n") if c.strip()]
     if not chunks:
         return []
-    if max_chunks_per_batch is not None and max_chunks_per_batch <= 0:
-        raise ValueError("max_chunks_per_batch must be positive when set")
     batches: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -1251,10 +1180,7 @@ def split_into_batches(
                     batches.append(piece)
             continue
         add_len = len(chunk) + (len(sep) if current else 0)
-        chunk_cap = (
-            max_chunks_per_batch is not None and len(current) >= max_chunks_per_batch
-        )
-        if current and (current_len + add_len > limit or chunk_cap):
+        if current and current_len + add_len > limit:
             flush()
         current.append(chunk)
         current_len += len(chunk) + (len(sep) if current_len else 0)
@@ -1263,16 +1189,10 @@ def split_into_batches(
 
 
 def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -> str:
-    """Re-anchor hard-split batches using compact [path] only.
-
-    Compact Gemini payload format reduces token usage while preserving file/line
-    mapping required for PR annotations. Never emit legacy # file / # note /
-    user_facing: labels. Batches that already start with [file:...] need no header.
-    """
-    stripped = batch.lstrip()
-    if batch_index == 0 or stripped.startswith("["):
+    """Re-anchor hard-split batches so mid-file cuts still carry # file context."""
+    if batch_index == 0 or batch.lstrip().startswith("# file:"):
         return batch
-    return f"[{path}]\n\n{batch}"
+    return f"# file: {path}\n# note: continuation of previous batch\n\n{batch}"
 
 
 def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False) -> None:
@@ -1287,34 +1207,15 @@ def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bo
             )
 
 
-def dedupe_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse overlap/batch duplicates; keep the highest severity per finding."""
-    best: dict[tuple[Any, ...], dict[str, Any]] = {}
-    order: list[tuple[Any, ...]] = []
-    for issue in issues:
-        key = (
-            issue.get("file"),
-            issue.get("line"),
-            issue.get("original"),
-            issue.get("suggestion"),
-        )
-        prev = best.get(key)
-        if prev is None:
-            best[key] = issue
-            order.append(key)
-            continue
-        if _SEVERITY_RANK.get(issue.get("severity"), 0) > _SEVERITY_RANK.get(prev.get("severity"), 0):
-            best[key] = issue
-    return [best[k] for k in order]
-
-
 def postprocess_issues(
     issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     issues = attach_locations(issues, added_details)
-    normalized = [normalize_issue_to_string_value(i) for i in issues]
-    recovered = recover_key_prefix_originals(normalized, added_details)
-    kept, dropped = filter_userfacing_issues(recovered, already_normalized=True)
+    issues = recover_key_prefix_originals(
+        [normalize_issue_to_string_value(i) for i in issues],
+        added_details,
+    )
+    kept, dropped = filter_userfacing_issues(issues)
     _log_filtered(dropped, "syntax/non-localization false positive(s)")
     kept, ph_dropped = filter_placeholder_mismatches(kept)
     if ph_dropped:
@@ -1324,10 +1225,6 @@ def postprocess_issues(
             "(suggestion must not add/remove placeholders like %d / {id})",
             show_samples=True,
         )
-    before = len(kept)
-    kept = dedupe_issues(kept)
-    if len(kept) < before:
-        print(f"Deduped {before - len(kept)} duplicate issue(s)", file=sys.stderr)
     return kept
 
 
@@ -1338,19 +1235,11 @@ def review_by_file_sessions(
     for path, text in review_by_file.items():
         if not text.strip():
             continue
-        focused = prefers_focused_batches(path, text)
-        chunks = review_chunks(text)
-        pack = focused_max_chunks_per_batch(len(chunks)) if focused else None
-        batches = split_into_batches(text, max_chunks_per_batch=pack)
+        batches = split_into_batches(text)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
-        mode = (
-            f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
-            if focused
-            else "packed"
-        )
         print(
-            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es), {mode}",
+            f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es)",
             file=sys.stderr,
         )
         for i, raw_batch in enumerate(batches):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Gemini Localization Quality Gate — review PR diffs for user-facing text issues.
+"""Localization Quality Gate — review PR diffs for user-facing text issues.
 
-CLI: python scripts/gemini_localization_review.py <diff_file>
+CLI: python .github/workflows/tools/localization_quality_gate.py <diff_file>
 Env: GEMINI_API_KEY (required), GITHUB_STEP_SUMMARY (optional)
 """
 
@@ -26,8 +26,8 @@ class GeminiModelQuota(NamedTuple):
 
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
@@ -37,7 +37,7 @@ HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 MAX_REVIEW_CHARS = 100_000  # default batch size for large EN packs
 # Locale/short files: pack chunks so each file uses about 1–FOCUSED_TARGET_BATCHES API calls.
-FOCUSED_TARGET_BATCHES = 3
+FOCUSED_TARGET_BATCHES = 2
 SHORT_FILE_MAX_CHUNKS = 40
 SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
@@ -1413,7 +1413,7 @@ def main(argv: list[str] | None = None) -> int:
     reset_model_failover_state()
     args = argv if argv is not None else sys.argv[1:]
     if len(args) != 1:
-        return fail("Usage: python scripts/gemini_localization_review.py <diff_file>")
+        return fail("Usage: python .github/workflows/tools/localization_quality_gate.py <diff_file>")
     try:
         with open(args[0], encoding="utf-8", errors="replace") as handle:
             diff_text = handle.read()

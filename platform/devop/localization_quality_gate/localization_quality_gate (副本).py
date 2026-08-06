@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Gemini Localization Quality Gate — review PR diffs for user-facing text issues.
+"""Localization Quality Gate — review PR diffs for user-facing text issues.
 
-CLI: python scripts/gemini_localization_review.py <diff_file>
+CLI: python platform/devop/localization_quality_gate/localization_quality_gate.py <diff_file>
 Env: GEMINI_API_KEY (required), GITHUB_STEP_SUMMARY (optional)
 """
 
@@ -26,8 +26,8 @@ class GeminiModelQuota(NamedTuple):
 
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
@@ -37,7 +37,9 @@ HTTP_TIMEOUT_SEC = 60
 MAX_ATTEMPTS = 3
 MAX_REVIEW_CHARS = 100_000  # default batch size for large EN packs
 # Locale/short files: pack chunks so each file uses about 1–FOCUSED_TARGET_BATCHES API calls.
-FOCUSED_TARGET_BATCHES = 3
+FOCUSED_TARGET_BATCHES = 2
+# Non-focused large files: still cap chunks/request so the model can inspect VALUES.
+PACKED_MAX_CHUNKS_PER_BATCH = 50
 SHORT_FILE_MAX_CHUNKS = 40
 SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
@@ -71,8 +73,13 @@ def active_model_id() -> str:
 
 
 def min_request_interval_sec(rpm: int | None = None) -> float:
+    """Minimum seconds between request *starts* to approach the model RPM limit.
+
+    Pace on start times (not end times) so API latency does not stack on top of
+    the full interval — otherwise effective RPM falls well below the quota.
+    """
     limit = active_model_quota().rpm if rpm is None else rpm
-    return 60.0 / limit + 0.1
+    return 60.0 / limit
 
 
 def gemini_endpoint(model_id: str) -> str:
@@ -110,6 +117,8 @@ KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
 KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
+# Nested object / array openers in TS/JS locale maps — not user-facing VALUES.
+STRUCT_OPEN_RE = re.compile(rf"^\s*{PROP_KEY}\s*:\s*[{{\[]\s*,?\s*$")
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
@@ -173,7 +182,8 @@ def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
 Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
-Input entries use compact form [file:line] then the VALUE (file/line required for PR annotations).
+Input entries use compact form [file:line] or [file:line|key] then the VALUE
+(file/line required for PR annotations; |key is optional context).
 Multiline VALUES encode embedded newlines as \\n (one line under the header).
 
 Rules:
@@ -235,11 +245,20 @@ def _escape_review_value(value: str) -> str:
     )
 
 
-def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> str:
+def _compact_review_entry(
+    path_label: str,
+    line_no: int,
+    values: list[str],
+    *,
+    key_name: str | None = None,
+) -> str:
     """Build one compact review entry for Gemini.
 
     Format (only allowed Gemini review_text shape):
       [file:line]
+      <VALUE>
+    or when key is known (helps key-typo / context without sending source syntax):
+      [file:line|key]
       <VALUE>
 
     Compact Gemini payload format reduces token usage while preserving file/line
@@ -250,9 +269,14 @@ def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> s
     cleaned = [v for v in values if v is not None and str(v) != ""]
     if not cleaned:
         return ""
+    header = (
+        f"[{path_label}:{line_no}|{key_name}]"
+        if key_name
+        else f"[{path_label}:{line_no}]"
+    )
     # Multiple cells (e.g. CSV) join with \\n on one VALUE line — same escape rules.
     escaped = [_escape_review_value(v) for v in cleaned]
-    return f"[{path_label}:{line_no}]\n" + "\\n".join(escaped)
+    return f"{header}\n" + "\\n".join(escaped)
 
 
 def _legacy_review_chunk_chars(
@@ -285,12 +309,14 @@ def _multiline_review_chunk(
 ) -> str:
     """Compact multiline VALUE payload (extraction / line tracking unchanged).
 
-    key_name / note / source_line are accepted for call-site compatibility but
-    omitted from the Gemini payload. Newlines inside VALUE are escaped by
-    _compact_review_entry; file+line stay in the compact header for annotations.
+    note / source_line are accepted for call-site compatibility but omitted from
+    the Gemini payload. key_name is kept in the compact header for context.
+    Newlines inside VALUE are escaped by _compact_review_entry.
     """
-    _ = (key_name, note, source_line)
-    return _compact_review_entry(path_label, line_no, user_facing_values)
+    _ = (note, source_line)
+    return _compact_review_entry(
+        path_label, line_no, user_facing_values, key_name=key_name,
+    )
 
 
 def _print_review_text_optimization(before: int, after: int) -> None:
@@ -691,7 +717,13 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
             if should_skip_review_line(text):
                 continue
+            if STRUCT_OPEN_RE.match(text):
+                # Nested map/array openers (e.g. configTool: {) are not VALUES.
+                continue
             hints = extract_user_facing_hints(text, path_label)
+            key_name = None
+            if assign := ASSIGNMENT_LINE_RE.match(text):
+                key_name = assign.group(1)
             if not hints:
                 # Unstructured added text (no KEY/JSON extract): review the line body
                 # as VALUE — same coverage as the old raw-window path, without metadata.
@@ -703,7 +735,9 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             # diff lines / duplicated peer VALUES are omitted from each entry: they
             # inflated tokens without improving VALUE spelling review once each line
             # already has its own compact [file:line] entry.
-            chunk = _compact_review_entry(path_label, line_no, hints)
+            chunk = _compact_review_entry(
+                path_label, line_no, hints, key_name=key_name,
+            )
             start = max(0, idx - CONTEXT_LINES)
             end = min(len(lines), idx + CONTEXT_LINES + 1)
             window = [
@@ -949,17 +983,11 @@ def format_step_summary(
         f"- Status: {status}",
         f"- High: {counts[SEVERITY_HIGH]} | Medium: {counts[SEVERITY_MEDIUM]} | Low: {counts[SEVERITY_LOW]}",
         f"- Duration: {duration}",
-        f"- Token usage: {usage}",
     ]
     if usage_stats:
-        models_s, limits_s = _models_and_limits_text(usage_stats, compact=False)
-        lines.extend([
-            f"- Models: {models_s}",
-            f"- API requests: {usage_stats['requests']} (paced ≥{usage_stats['min_interval_sec']:.1f}s; limits {limits_s})",
-            f"- Tokens: prompt={usage_stats['prompt_tokens']} candidates={usage_stats['candidates_tokens']} total={usage_stats['total_tokens']}",
-            f"- Review payload: sent={usage_stats['chars_sent']} chars, "
-            f"batches={usage_stats['batches']}, files={usage_stats['files_reviewed']}",
-        ])
+        lines.extend(f"- {line}" for line in format_usage_lines(usage_stats))
+    else:
+        lines.append(f"- Token usage: {usage}")
     if extra_note:
         lines.append(f"- Note: {extra_note}")
     lines.extend(["", "### Changed files", ""])
@@ -1134,6 +1162,7 @@ def empty_usage_stats() -> dict[str, Any]:
         "models_used": [], "model_limits": {},
         "rpm_limit": primary.rpm, "tpm_limit": primary.tpm or 0, "rpd_limit": primary.rpd,
         "min_interval_sec": min_request_interval_sec(primary.rpm),
+        "wall_sec": 0.0, "effective_rpm": None,
     }
 
 
@@ -1172,15 +1201,34 @@ def _models_and_limits_text(stats: dict[str, Any], *, compact: bool = False) -> 
     return models_s, limits_s
 
 
+def format_usage_lines(stats: dict[str, Any]) -> list[str]:
+    """Clear usage lines: effective RPM, RPD this run, total tokens, request scope."""
+    models_s, _ = _models_and_limits_text(stats, compact=False)
+    eff = stats.get("effective_rpm")
+    rpm_s = f"{eff:.1f}/min effective" if isinstance(eff, (int, float)) else "N/A"
+    return [
+        f"RPM: {rpm_s} (limit {stats['rpm_limit']})",
+        f"RPD: {stats['requests']} this run (limit {stats['rpd_limit']})",
+        (
+            f"Tokens: total={stats['total_tokens']} "
+            f"(prompt={stats['prompt_tokens']}, candidates={stats['candidates_tokens']})"
+        ),
+        (
+            f"Requests: {stats['requests']} on {models_s} "
+            f"(pace ≥{stats['min_interval_sec']:.1f}s; batches={stats['batches']}, "
+            f"files={stats['files_reviewed']}, chars={stats['chars_sent']})"
+        ),
+    ]
+
+
 def format_usage_summary(stats: dict[str, Any]) -> str:
-    models_s, limits_s = _models_and_limits_text(stats, compact=True)
-    return (
-        f"requests={stats['requests']} (limits {limits_s}), models={models_s}, "
-        f"prompt_tokens={stats['prompt_tokens']}, candidates_tokens={stats['candidates_tokens']}, "
-        f"total_tokens={stats['total_tokens']}, chars_sent={stats['chars_sent']}, "
-        f"batches={stats['batches']}, "
-        f"files={stats['files_reviewed']}, pace>={stats['min_interval_sec']:.1f}s/req"
-    )
+    return " | ".join(format_usage_lines(stats))
+
+
+def print_usage_summary(stats: dict[str, Any]) -> None:
+    print("Usage:", file=sys.stderr)
+    for line in format_usage_lines(stats):
+        print(f"  {line}", file=sys.stderr)
 
 
 def review_chunks(review_text: str) -> list[str]:
@@ -1199,12 +1247,27 @@ def prefers_focused_batches(path: str, review_text: str) -> bool:
 
 
 def focused_max_chunks_per_batch(chunk_count: int) -> int:
-    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests."""
+    """Pack chunks so a focused file stays within about FOCUSED_TARGET_BATCHES requests.
+
+    Also caps each request at PACKED_MAX_CHUNKS_PER_BATCH so large Chinese/PT
+    files do not reintroduce attention dilution.
+    """
     if chunk_count <= 0:
         return 1
     if chunk_count <= FOCUSED_TARGET_BATCHES:
         return chunk_count  # single request
-    return (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
+    by_target = (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
+    return min(by_target, PACKED_MAX_CHUNKS_PER_BATCH)
+
+
+def max_chunks_per_batch_for_file(path: str, review_text: str) -> int | None:
+    """Choose chunk packing: focused ~1–N batches; large packed files cap per request."""
+    chunks = review_chunks(review_text)
+    if prefers_focused_batches(path, review_text):
+        return focused_max_chunks_per_batch(len(chunks))
+    if len(chunks) > PACKED_MAX_CHUNKS_PER_BATCH:
+        return PACKED_MAX_CHUNKS_PER_BATCH
+    return None
 
 
 def split_into_batches(
@@ -1335,20 +1398,21 @@ def review_by_file_sessions(
     api_key: str, review_by_file: dict[str, str],
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
     all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
+    wall_t0 = time.monotonic()
     for path, text in review_by_file.items():
         if not text.strip():
             continue
         focused = prefers_focused_batches(path, text)
-        chunks = review_chunks(text)
-        pack = focused_max_chunks_per_batch(len(chunks)) if focused else None
+        pack = max_chunks_per_batch_for_file(path, text)
         batches = split_into_batches(text, max_chunks_per_batch=pack)
         stats["files_reviewed"] += 1
         stats["batches"] += len(batches)
-        mode = (
-            f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
-            if focused
-            else "packed"
-        )
+        if focused:
+            mode = f"focused(≤{FOCUSED_TARGET_BATCHES} batches, {pack} chunk(s)/req)"
+        elif pack is not None:
+            mode = f"packed(≤{pack} chunk(s)/req)"
+        else:
+            mode = "packed"
         print(
             f"Review session: {path} — {len(text)} chars, {len(batches)} batch(es), {mode}",
             file=sys.stderr,
@@ -1358,17 +1422,18 @@ def review_by_file_sessions(
             if len(batches) > 1:
                 print(f"  batch {i + 1}/{len(batches)}: {len(batch)} chars", file=sys.stderr)
             quota = active_model_quota()
+            # Pace by request *start* spacing so we can approach the full RPM budget.
             interval = min_request_interval_sec(quota.rpm)
             if last_request_at > 0:
                 wait = interval - (time.monotonic() - last_request_at)
                 if wait > 0:
                     print(
-                        f"  rate-limit pace: sleeping {wait:.1f}s (RPM≤{quota.rpm} on {quota.model_id})",
+                        f"  rate-limit pace: sleeping {wait:.1f}s (target RPM≤{quota.rpm} on {quota.model_id})",
                         file=sys.stderr,
                     )
                     time.sleep(wait)
-            api_payload, duration = call_gemini(api_key, build_prompt(batch))
             last_request_at = time.monotonic()
+            api_payload, duration = call_gemini(api_key, build_prompt(batch))
             total_duration += duration
             stats["requests"] += 1
             record_model_usage(stats, active_model_quota())
@@ -1382,7 +1447,11 @@ def review_by_file_sessions(
                 if not issue.get("file"):
                     issue["file"] = path
             all_issues.extend(parsed["issues"])
-    print(f"Usage: {format_usage_summary(stats)}", file=sys.stderr)
+    if stats["requests"] > 0:
+        stats["wall_sec"] = time.monotonic() - wall_t0
+        if stats["wall_sec"] > 0:
+            stats["effective_rpm"] = stats["requests"] / (stats["wall_sec"] / 60.0)
+    print_usage_summary(stats)
     return all_issues, total_duration, stats
 
 
@@ -1413,7 +1482,10 @@ def main(argv: list[str] | None = None) -> int:
     reset_model_failover_state()
     args = argv if argv is not None else sys.argv[1:]
     if len(args) != 1:
-        return fail("Usage: python scripts/gemini_localization_review.py <diff_file>")
+        return fail(
+            "Usage: python platform/devop/localization_quality_gate/"
+            "localization_quality_gate.py <diff_file>"
+        )
     try:
         with open(args[0], encoding="utf-8", errors="replace") as handle:
             diff_text = handle.read()

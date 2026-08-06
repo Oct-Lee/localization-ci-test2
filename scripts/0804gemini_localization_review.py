@@ -26,8 +26,8 @@ class GeminiModelQuota(NamedTuple):
 
 
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
@@ -41,7 +41,7 @@ FOCUSED_TARGET_BATCHES = 3
 SHORT_FILE_MAX_CHUNKS = 40
 SHORT_FILE_MAX_CHARS = 20_000
 QUOTA_RETRY_DEFAULT_SEC = 60.0
-MAX_QUOTA_RETRIES = 5
+MAX_QUOTA_RETRIES = 40
 CONTEXT_LINES = 1  # light neighbor window; kept small to avoid diluting focused batches
 # Paths that need smaller focused batches for CJK/PT recall.
 _FOCUSED_PATH_RE = re.compile(
@@ -108,15 +108,12 @@ FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | r
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
-KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
+KEY_ASSIGN_PREFIX_RE = re.compile(rf"^({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
-# Match quoted VALUE lines; honor escapes so \" / \' do not end the string early.
-STRING_VALUE_LINE_RE = re.compile(
-    r"""^\s*(['"])((?:\\.|(?!\1)[^\r\n])*)\1\s*,?\s*$"""
-)
+STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])(.*)\1\s*,?\s*$""")
 ASSIGNMENT_LINE_RE = re.compile(rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""", re.DOTALL)
 JSON_KV_RE = re.compile(r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$""")
 SKIP_LINE_RE = re.compile(
@@ -173,8 +170,7 @@ def build_prompt(review_text: str) -> str:
     return f"""You are a Localization Quality Reviewer for the UnitX monorepo.
 Review ONLY user-facing string VALUES (English / Simplified Chinese / Portuguese).
 Formats: JS/TS KEY: 'value'; Python KEY = "..." / KEY = (\\n  "..."\\n); JSON; CSV language cells.
-Input entries use compact form [file:line] then the VALUE (file/line required for PR annotations).
-Multiline VALUES encode embedded newlines as \\n (one line under the header).
+Prefer lines tagged user_facing:.
 
 Rules:
 1) original/suggestion = VALUE only — never whole KEY lines or bare "KEY =" / "KEY:".
@@ -182,9 +178,8 @@ Rules:
 3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
 4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
 5) Leading/trailing whitespace style → severity "low" only (never high/medium).
-6) Inspect EVERY VALUE carefully (character-level spelling/grammar/wrong words,
-   including Chinese character mistakes, wrong characters, and incorrect word usage).
-   Do not skip entries.
+6) Inspect EVERY user_facing VALUE carefully (character-level spelling/grammar/wrong words,
+   including CJK near-miss characters). Do not skip tagged lines.
 Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
 
 Severity (lowercase): high = VALUE spelling/grammar/wrong word; medium = wording;
@@ -222,50 +217,10 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
     return []
 
 
-def _escape_review_value(value: str) -> str:
-    """Escape embedded newlines in a VALUE for compact Gemini payload.
-
-    Normalize CRLF/CR to the two-character sequence \\n so a multiline VALUE stays
-    one physical line under [file:line] and is not read as another entry.
-    """
-    return (
-        value.replace("\r\n", "\\n")
-        .replace("\r", "\\n")
-        .replace("\n", "\\n")
-    )
-
-
-def _compact_review_entry(path_label: str, line_no: int, values: list[str]) -> str:
-    """Build one compact review entry for Gemini.
-
-    Format (only allowed Gemini review_text shape):
-      [file:line]
-      <VALUE>
-
-    Compact Gemini payload format reduces token usage while preserving file/line
-    mapping required for PR annotations. Legacy verbose labels (# file / # line /
-    user_facing: / source syntax) are intentionally omitted. Multiline VALUES use
-    \\n escapes so only the header line carries structure.
-    """
-    cleaned = [v for v in values if v is not None and str(v) != ""]
-    if not cleaned:
-        return ""
-    # Multiple cells (e.g. CSV) join with \\n on one VALUE line — same escape rules.
-    escaped = [_escape_review_value(v) for v in cleaned]
-    return f"[{path_label}:{line_no}]\n" + "\\n".join(escaped)
-
-
-def _legacy_review_chunk_chars(
-    path_label: str,
-    line_no: int,
-    values: list[str],
-    *,
-    key_name: str | None = None,
-    note: str | None = None,
-    source_line: str | None = None,
-    context_body: str | None = None,
-) -> int:
-    """Approximate pre-optimization review chunk size (stderr metrics only; not sent)."""
+def _multiline_review_chunk(
+    path_label: str, line_no: int, user_facing_values: list[str], *,
+    key_name: str | None = None, note: str | None = None, source_line: str | None = None,
+) -> str:
     parts = [f"# file: {path_label}", f"# line: {line_no}"]
     if key_name:
         parts.append(f"# key: {key_name}")
@@ -273,39 +228,8 @@ def _legacy_review_chunk_chars(
         parts.append(f"# note: {note}")
     if source_line is not None:
         parts.append(source_line if source_line.startswith("+") else f"+{source_line}")
-    if context_body:
-        parts.append(context_body)
-    parts.extend(f"user_facing: {v}" for v in values if v is not None and str(v) != "")
-    return len("\n".join(parts))
-
-
-def _multiline_review_chunk(
-    path_label: str, line_no: int, user_facing_values: list[str], *,
-    key_name: str | None = None, note: str | None = None, source_line: str | None = None,
-) -> str:
-    """Compact multiline VALUE payload (extraction / line tracking unchanged).
-
-    key_name / note / source_line are accepted for call-site compatibility but
-    omitted from the Gemini payload. Newlines inside VALUE are escaped by
-    _compact_review_entry; file+line stay in the compact header for annotations.
-    """
-    _ = (key_name, note, source_line)
-    return _compact_review_entry(path_label, line_no, user_facing_values)
-
-
-def _print_review_text_optimization(before: int, after: int) -> None:
-    """Temporary stderr metric: review_text size before/after compact format."""
-    if before <= 0:
-        reduction = 0.0
-    else:
-        reduction = (before - after) * 100.0 / before
-    print(
-        "Review text optimization:\n"
-        f"before={before} chars\n"
-        f"after={after} chars\n"
-        f"reduction={reduction:.1f}%",
-        file=sys.stderr,
-    )
+    parts.extend(f"user_facing: {v}" for v in user_facing_values)
+    return "\n".join(parts)
 
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
@@ -338,10 +262,8 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
     out = dict(issue)
     original_raw = out.get("original", "")
     suggestion_raw = out.get("suggestion", "")
-    # Do not .strip() before matching: VALUE leading/trailing whitespace is meaningful
-    # (forced to low later). Assignment / key-prefix patterns already allow ^\\s*.
-    o_m = ASSIGNMENT_LINE_RE.match(original_raw)
-    s_m = ASSIGNMENT_LINE_RE.match(suggestion_raw)
+    original, suggestion = original_raw.strip(), suggestion_raw.strip()
+    o_m, s_m = ASSIGNMENT_LINE_RE.match(original), ASSIGNMENT_LINE_RE.match(suggestion)
     if o_m and s_m:
         if o_m.group(1) != s_m.group(1):
             out.update(original=o_m.group(1), suggestion=s_m.group(1), _kind="identifier")
@@ -354,10 +276,10 @@ def normalize_issue_to_string_value(issue: dict[str, Any]) -> dict[str, Any]:
             out["suggestion"] = suggestion_raw
         return out
     # Model sometimes emits bare "KEY =" / "KEY:" instead of the quoted VALUE.
-    if m := KEY_ASSIGN_PREFIX_RE.match(original_raw):
+    if m := KEY_ASSIGN_PREFIX_RE.match(original):
         out["_recover_original"] = True
         out["_key_name"] = m.group(1)
-        if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion_raw):
+        if suggestion_raw and not KEY_ASSIGN_PREFIX_RE.match(suggestion):
             out["suggestion"] = suggestion_raw
         return out
     # Keep raw strings so intentional leading spaces are not stripped away.
@@ -595,8 +517,6 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
     review_chunks: list[str] = []
     review_by_file: OrderedDict[str, list[str]] = OrderedDict()
     seen, skip_indices = set(), set()
-    # Pre-optimization size estimate (legacy verbose format) for stderr metrics only.
-    legacy_chunk_chars: list[int] = []
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
@@ -639,25 +559,16 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                     skip_indices.update(skip_idxs)
                     value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
                     key_name = triple.group(1)
-                    source_line = (
-                        f"+  {key_name} = {triple.group('q')}...{triple.group('q')}"
-                    )
-                    note = "python triple-quoted string"
                     chunk = _multiline_review_chunk(
                         path_label, value_line_no, [string_val], key_name=key_name,
-                        note=note, source_line=source_line,
+                        note="python triple-quoted string",
+                        source_line=f"+  {key_name} = {triple.group('q')}...{triple.group('q')}",
                     )
                     dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                    if dedupe_key not in seen and chunk:
+                    if dedupe_key not in seen:
                         seen.add(dedupe_key)
                         review_chunks.append(chunk)
                         review_by_file.setdefault(path_label, []).append(chunk)
-                        legacy_chunk_chars.append(
-                            _legacy_review_chunk_chars(
-                                path_label, value_line_no, [string_val],
-                                key_name=key_name, note=note, source_line=source_line,
-                            )
-                        )
                     continue
             key_only, py_open = KEY_ONLY_LINE_RE.match(text), PY_KEY_OPEN_RE.match(text)
             merged_value = None
@@ -669,59 +580,40 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
                 key_name = (key_only or py_open).group(1)
                 opener = f"{key_name}:" if key_only else f"{key_name} = ("
-                source_line = f"+  {opener}\n+    {string_val!r}"
-                note = "multiline KEY + string value (valid formatting)"
                 chunk = _multiline_review_chunk(
                     path_label, value_line_no, [string_val], key_name=key_name,
-                    note=note, source_line=source_line,
+                    note="multiline KEY + string value (valid formatting)",
+                    source_line=f"+  {opener}\n+    {string_val!r}",
                 )
                 dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
-                if dedupe_key not in seen and chunk:
+                if dedupe_key not in seen:
                     seen.add(dedupe_key)
                     review_chunks.append(chunk)
                     review_by_file.setdefault(path_label, []).append(chunk)
-                    legacy_chunk_chars.append(
-                        _legacy_review_chunk_chars(
-                            path_label, value_line_no, [string_val],
-                            key_name=key_name, note=note, source_line=source_line,
-                        )
-                    )
                 continue
             if key_only or py_open:
                 continue
             if should_skip_review_line(text):
                 continue
             hints = extract_user_facing_hints(text, path_label)
-            if not hints:
-                # Unstructured added text (no KEY/JSON extract): review the line body
-                # as VALUE — same coverage as the old raw-window path, without metadata.
-                stripped = text.strip()
-                if not stripped:
-                    continue
-                hints = [stripped]
-            # CONTEXT_LINES remains 1 for hard-split overlap elsewhere. Neighbor raw
-            # diff lines / duplicated peer VALUES are omitted from each entry: they
-            # inflated tokens without improving VALUE spelling review once each line
-            # already has its own compact [file:line] entry.
-            chunk = _compact_review_entry(path_label, line_no, hints)
-            start = max(0, idx - CONTEXT_LINES)
-            end = min(len(lines), idx + CONTEXT_LINES + 1)
+            # Keep ±CONTEXT_LINES neighbors; keep small to avoid diluting model attention.
+            start, end = max(0, idx - CONTEXT_LINES), min(len(lines), idx + CONTEXT_LINES + 1)
             window = [
                 lines[j] for j in range(start, end)
-                if not lines[j].startswith(("---", "+++", "@@")) and lines[j].strip()
+                if not lines[j].startswith(("---", "+++", "@@"))
             ]
-            legacy_context = "\n".join(window) if window else f"+{text}"
-            dedupe_key = f"{path_label}:{line_no}:{chunk}"
-            if dedupe_key in seen or not chunk:
+            if not window and not hints:
+                continue
+            body = "\n".join(window) if window else f"+{text}"
+            if hints:
+                body += "\n" + "\n".join(f"user_facing: {h}" for h in hints)
+            dedupe_key = f"{path_label}:{line_no}:{body}"
+            if dedupe_key in seen:
                 continue
             seen.add(dedupe_key)
+            chunk = f"# file: {path_label}\n# line: {line_no}\n{body}"
             review_chunks.append(chunk)
             review_by_file.setdefault(path_label, []).append(chunk)
-            legacy_chunk_chars.append(
-                _legacy_review_chunk_chars(
-                    path_label, line_no, hints, context_body=legacy_context,
-                )
-            )
             continue
         if line.startswith("-") and not line.startswith("---"):
             ensure_file(current_file or "(unknown)")["deleted"] += 1
@@ -733,13 +625,8 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}
-    review_text = "\n\n".join(review_chunks)
-    sep = 2  # "\n\n" between chunks
-    before = sum(legacy_chunk_chars) + sep * max(0, len(legacy_chunk_chars) - 1)
-    after = len(review_text)
-    _print_review_text_optimization(before, after)
     return {
-        "review_text": review_text,
+        "review_text": "\n\n".join(review_chunks),
         "review_by_file": review_by_file_text,
         "files": files_out,
         "_added_line_details": {p: files_map[p]["added_lines"] for p in files_order},
@@ -1085,21 +972,9 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
         if response.status_code in (500, 503):
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
-                if try_advance_model(
-                    f"HTTP {response.status_code} after {MAX_ATTEMPTS} attempts on {model_id}"
-                ):
-                    quota_retries = transient_attempts = 0
-                    pace_after_model_failover()
-                    continue
                 raise RuntimeError(
-                    f"Gemini API failed with HTTP {response.status_code} on all models "
-                    f"({', '.join(GEMINI_MODELS)}): {response.text[:1000]}"
+                    f"Gemini API failed with HTTP {response.status_code}: {response.text[:1000]}"
                 )
-            print(
-                f"HTTP {response.status_code} on {model_id}. "
-                f"Retry {transient_attempts}/{MAX_ATTEMPTS} then failover if still failing",
-                file=sys.stderr,
-            )
             _sleep_transient_backoff(transient_attempts)
             continue
         raise RuntimeError(
@@ -1263,16 +1138,10 @@ def split_into_batches(
 
 
 def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -> str:
-    """Re-anchor hard-split batches using compact [path] only.
-
-    Compact Gemini payload format reduces token usage while preserving file/line
-    mapping required for PR annotations. Never emit legacy # file / # note /
-    user_facing: labels. Batches that already start with [file:...] need no header.
-    """
-    stripped = batch.lstrip()
-    if batch_index == 0 or stripped.startswith("["):
+    """Re-anchor hard-split batches so mid-file cuts still carry # file context."""
+    if batch_index == 0 or batch.lstrip().startswith("# file:"):
         return batch
-    return f"[{path}]\n\n{batch}"
+    return f"# file: {path}\n# note: continuation of previous batch\n\n{batch}"
 
 
 def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False) -> None:

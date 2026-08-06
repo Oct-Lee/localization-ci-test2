@@ -1,0 +1,102 @@
+name: Localization Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  localization-review:
+    name: Localization Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # ===== SINGLE SOURCE OF TRUTH: edit path scope ONLY here =====
+      # Based on monorepo user-facing i18n inventory (locales / translations* / i18n).
+      # Do NOT include vendor paths (select2, vditor, erupt framework, *.so).
+      LOCALIZATION_GATE_PATHSPECS: >-
+        apps/optix/ui/locales/lang
+        apps/optix/ui/app/translations
+        apps/central/central_web/src/locales/lang
+        apps/central_client/src/locales/lang
+        apps/digix_client/digix_client_ui/src/locales/lang
+        apps/digix_client/digix_client_src/translations
+        apps/report_tool/web/src/i18n/locales
+        apps/cortex/ui/app/translations
+        apps/smart-camera/frontend/src/i18n
+        apps/production/production_src/translations_prod
+        platform/boot_check/translations
+        platform/upgrade_agent/app/i18n
+        platform/upgrade_agent/frontend/src/assets/i18n.csv
+        :(glob)**/translations_optix/**
+        :(glob)**/translations_backend/**
+        :(glob)**/translations_prod/**
+        :(glob)shared/config/**/translations/**
+        :(glob)**/translations*/english.py
+        :(glob)**/translations*/chinese.py
+        :(glob)**/translations*/portuguese.py
+        :(glob)**/translations*/english.js
+        :(glob)**/translations*/chinese.js
+        :(glob)**/translations*/portuguese.js
+        :(glob)**/locales/lang/english.ts
+        :(glob)**/locales/lang/chinese.ts
+        :(glob)**/locales/lang/portuguese.ts
+        :(glob)apps/x/**/resources/i18n/**
+        :(glob)apps/x/central-web/**/assets/i18n.csv
+        :(glob)apps/x/edge-web/**/assets/i18n.csv
+      # ===== end pathspecs =====
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR changed lines in scope
+        id: scoped_diff
+        run: |
+          set -euo pipefail
+          if [ -z "${LOCALIZATION_GATE_PATHSPECS// }" ]; then
+            echo "LOCALIZATION_GATE_PATHSPECS is empty" >&2
+            exit 1
+          fi
+          git diff \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            --unified=0 \
+            -- ${LOCALIZATION_GATE_PATHSPECS} \
+            > pr.diff
+
+          if [ ! -s pr.diff ]; then
+            echo "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API"
+            echo "in_scope=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "in_scope=true" >> "$GITHUB_OUTPUT"
+          echo "=== pr.diff (first 200 lines) ==="
+          head -n 200 pr.diff || true
+
+      - name: Set up Python
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        run: |
+          python -c "import requests" 2>/dev/null \
+            || python -m pip install "requests>=2.31.0,<3"
+
+      - name: Run localization quality gate
+        if: steps.scoped_diff.outputs.in_scope == 'true'
+        run: python .github/workflows/tools/localization_quality_gate.py pr.diff
