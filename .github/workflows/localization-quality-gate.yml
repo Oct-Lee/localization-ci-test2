@@ -23,7 +23,7 @@ jobs:
   localization-review:
     name: Localization Quality Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # ===== SINGLE SOURCE OF TRUTH: edit path scope ONLY here =====
@@ -122,3 +122,18 @@ jobs:
       - name: Run localization quality gate
         if: steps.scoped_diff.outputs.in_scope == 'true'
         run: python platform/devop/localization_quality_gate/localization_quality_gate.py pr.diff
+
+  localization-quality-gate-required:
+    name: Localization Quality Gate Required
+    needs:
+      - localization-review
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more localization quality gate jobs failed or were cancelled."
+            exit 1
+          fi
+          echo "All localization quality gate jobs passed or were skipped."
