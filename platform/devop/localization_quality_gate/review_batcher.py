@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from config import (
+    _FOCUSED_PATH_RE,
     CONTEXT_LINES,
     FOCUSED_TARGET_BATCHES,
     MAX_REVIEW_CHARS,
     PACKED_MAX_CHUNKS_PER_BATCH,
     SHORT_FILE_MAX_CHARS,
     SHORT_FILE_MAX_CHUNKS,
-    _FOCUSED_PATH_RE,
 )
+
 
 def prefers_focused_batches(path: str, review_text: str) -> bool:
     """Chinese/PT locale paths, or short files: use focused batching."""
@@ -22,8 +23,10 @@ def prefers_focused_batches(path: str, review_text: str) -> bool:
         and len(review_text) <= SHORT_FILE_MAX_CHARS
     )
 
+
 def review_chunks(review_text: str) -> list[str]:
     return [c for c in review_text.split("\n\n") if c.strip()]
+
 
 def focused_max_chunks_per_batch(chunk_count: int) -> int:
     if chunk_count <= 0:
@@ -33,6 +36,7 @@ def focused_max_chunks_per_batch(chunk_count: int) -> int:
     by_target = (chunk_count + FOCUSED_TARGET_BATCHES - 1) // FOCUSED_TARGET_BATCHES
     return min(by_target, PACKED_MAX_CHUNKS_PER_BATCH)
 
+
 def max_chunks_per_batch_for_file(path: str, review_text: str) -> int | None:
     chunks = review_chunks(review_text)
     if prefers_focused_batches(path, review_text):
@@ -41,13 +45,48 @@ def max_chunks_per_batch_for_file(path: str, review_text: str) -> int | None:
         return PACKED_MAX_CHUNKS_PER_BATCH
     return None
 
+
+def _should_flush(
+    *,
+    has_current: bool,
+    current_len: int,
+    add_len: int,
+    limit: int,
+    current_chunk_count: int,
+    max_chunks_per_batch: int | None,
+) -> bool:
+    """Whether to close the current batch before appending the next chunk."""
+    if not has_current:
+        return False
+    if current_len + add_len > limit:
+        return True
+    if max_chunks_per_batch is not None and current_chunk_count >= max_chunks_per_batch:
+        return True
+    return False
+
+
+def _split_oversized_chunk(chunk: str, limit: int) -> list[str]:
+    """Hard-split one oversized chunk; overlap last CONTEXT_LINES into the next
+    piece."""
+    hard = split_text_for_limit(chunk, limit)
+    if not hard:
+        return []
+    out: list[str] = [hard[0]]
+    for i in range(1, len(hard)):
+        prev_tail = "\n".join(hard[i - 1].splitlines()[-CONTEXT_LINES:])
+        piece = hard[i]
+        merged = f"{prev_tail}\n{piece}" if prev_tail else piece
+        out.append(merged if len(merged) <= limit else piece)
+    return out
+
+
 def split_into_batches(
     review_text: str,
     limit: int | None = None,
     *,
     max_chunks_per_batch: int | None = None,
 ) -> list[str]:
-    """Pack whole review chunks (separated by \n\n)."""
+    """Pack whole review chunks (separated by \\n\\n)."""
     if limit is None:
         limit = MAX_REVIEW_CHARS
     if not review_text.strip():
@@ -71,29 +110,23 @@ def split_into_batches(
     for chunk in chunks:
         if len(chunk) > limit:
             flush()
-            hard = split_text_for_limit(chunk, limit)
-            # Overlap last CONTEXT_LINES of previous hard piece into the next.
-            for i, piece in enumerate(hard):
-                if i == 0:
-                    batches.append(piece)
-                    continue
-                prev_tail = "\n".join(hard[i - 1].splitlines()[-CONTEXT_LINES:])
-                merged = f"{prev_tail}\n{piece}" if prev_tail else piece
-                if len(merged) <= limit:
-                    batches.append(merged)
-                else:
-                    batches.append(piece)
+            batches.extend(_split_oversized_chunk(chunk, limit))
             continue
         add_len = len(chunk) + (len(sep) if current else 0)
-        chunk_cap = (
-            max_chunks_per_batch is not None and len(current) >= max_chunks_per_batch
-        )
-        if current and (current_len + add_len > limit or chunk_cap):
+        if _should_flush(
+            has_current=bool(current),
+            current_len=current_len,
+            add_len=add_len,
+            limit=limit,
+            current_chunk_count=len(current),
+            max_chunks_per_batch=max_chunks_per_batch,
+        ):
             flush()
         current.append(chunk)
         current_len += len(chunk) + (len(sep) if current_len else 0)
     flush()
     return batches
+
 
 def split_text_for_limit(text: str, limit: int) -> list[str]:
     if limit <= 0:
@@ -118,6 +151,7 @@ def split_text_for_limit(text: str, limit: int) -> list[str]:
         pieces.append(text[start:cut])
         start = cut
     return pieces
+
 
 def with_batch_continuation_header(path: str, batch: str, *, batch_index: int) -> str:
     """Add [path] header if batch doesn't start with a file marker."""

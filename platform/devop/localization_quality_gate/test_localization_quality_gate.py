@@ -1,4 +1,5 @@
-"""Unit tests for platform/devop/localization_quality_gate/localization_quality_gate.py."""
+"""Unit tests for
+platform/devop/localization_quality_gate/localization_quality_gate.py."""
 
 from __future__ import annotations
 
@@ -13,9 +14,7 @@ import requests
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _SCRIPT = _PACKAGE_DIR / "localization_quality_gate.py"
-_SPEC = importlib.util.spec_from_file_location(
-    "localization_quality_gate", _SCRIPT
-)
+_SPEC = importlib.util.spec_from_file_location("localization_quality_gate", _SCRIPT)
 assert _SPEC and _SPEC.loader
 gate = importlib.util.module_from_spec(_SPEC)
 sys.modules["localization_quality_gate"] = gate
@@ -128,19 +127,30 @@ def test_attach_locations_from_added_lines():
 
 
 def test_attach_locations_does_not_overwrite_known_line():
-    issues = [{
-        "file": "a.json", "line": 99, "original": "not Founded",
-        "problem": "grammar", "suggestion": "not found", "severity": "high",
-    }]
+    issues = [
+        {
+            "file": "a.json",
+            "line": 99,
+            "original": "not Founded",
+            "problem": "grammar",
+            "suggestion": "not found",
+            "severity": "high",
+        }
+    ]
     details = {"a.json": [{"line": 42, "text": '  "x": "not Founded"'}]}
     out = gate.attach_locations(issues, details)
     assert out[0]["line"] == 99
 
 
 def test_attach_locations_skips_ambiguous_substring():
-    issues = [{
-        "original": "ok", "problem": "style", "suggestion": "OK", "severity": "low",
-    }]
+    issues = [
+        {
+            "original": "ok",
+            "problem": "style",
+            "suggestion": "OK",
+            "severity": "low",
+        }
+    ]
     details = {
         "a.json": [{"line": 1, "text": '  "a": "ok"'}],
         "b.json": [{"line": 2, "text": '  "b": "ok"'}],
@@ -361,9 +371,9 @@ def test_placeholders_percent_and_dollar():
 
 
 def test_string_value_line_re_handles_escaped_quotes():
-    m = gate.STRING_VALUE_LINE_RE.match(r'''  "He said \"hi\"",''')
+    m = gate.STRING_VALUE_LINE_RE.match(r"""  "He said \"hi\"",""")
     assert m is not None
-    assert m.group(2) == r'He said \"hi\"'
+    assert m.group(2) == r"He said \"hi\""
     m2 = gate.STRING_VALUE_LINE_RE.match(r"  'it\'s ok',")
     assert m2 is not None
     assert m2.group(2) == r"it\'s ok"
@@ -392,7 +402,12 @@ def test_normalize_issue_does_not_strip_value_whitespace():
     assert out["suggestion"] == "{}【判定条件】"
     # Bare KEY = still recovered without stripping VALUE-only originals.
     bare = gate.normalize_issue_to_string_value(
-        {"original": "  MSG =", "suggestion": "hello", "problem": "x", "severity": "high"}
+        {
+            "original": "  MSG =",
+            "suggestion": "hello",
+            "problem": "x",
+            "severity": "high",
+        }
     )
     assert bare.get("_recover_original") is True
     assert bare.get("_key_name") == "MSG"
@@ -480,9 +495,9 @@ def test_dedupe_keeps_highest_severity():
 
 
 def test_has_blocking_issues_only_high():
-    assert gate.has_blocking_issues(
-        [{"severity": "medium"}, {"severity": "low"}]
-    ) is False
+    assert (
+        gate.has_blocking_issues([{"severity": "medium"}, {"severity": "low"}]) is False
+    )
     assert gate.has_blocking_issues([{"severity": "high"}]) is True
 
 
@@ -559,7 +574,10 @@ def test_format_usage_lines_highlights_rpm_rpd_tokens():
     assert "Tokens: total=97209 (prompt=79977, candidates=17232)" in joined
     assert "Requests: 47 on gemini-3.1-flash-lite" in joined
     md = gate.format_step_summary(
-        status="PASSED", issues=[], duration_sec=200.0, usage_stats=stats,
+        status="PASSED",
+        issues=[],
+        duration_sec=200.0,
+        usage_stats=stats,
     )
     assert "Token usage:" not in md
     assert "RPM: 14.1/min effective (limit 15)" in md
@@ -719,6 +737,39 @@ def test_filter_allowlisted_by_original_and_optional_file():
     assert kept[1]["original"] == "Other"
 
 
+def test_filter_allowlisted_domain_term_inside_value():
+    entries = [{"original": "采像"}, {"original": "IPC"}]
+    issues = [
+        {
+            "file": "shared/config/unitxconfig/translations/chinese.py",
+            "original": "不能使用重复的采像设置",
+            "problem": "采像应为成像",
+            "suggestion": "不能使用重复的成像设置",
+            "severity": "high",
+        },
+        {
+            "file": "platform/boot_check/translations/english.py",
+            "original": "Try restarting the software or IPC to recover",
+            "problem": "Spell out IPC",
+            "suggestion": "Try restarting the software or industrial PC to recover",
+            "severity": "high",
+        },
+        {
+            "file": "apps/foo/translations/english.js",
+            "original": "IPConfig failed",
+            "problem": "typo",
+            "suggestion": "IP config failed",
+            "severity": "high",
+        },
+    ]
+    kept, dropped = gate.filter_allowlisted(issues, entries)
+    assert {d["original"] for d in dropped} == {
+        "不能使用重复的采像设置",
+        "Try restarting the software or IPC to recover",
+    }
+    assert [k["original"] for k in kept] == ["IPConfig failed"]
+
+
 def test_load_allowlist_and_postprocess(tmp_path: Path):
     allow = tmp_path / "allowlist.json"
     allow.write_text(
@@ -749,7 +800,8 @@ def test_load_allowlist_and_postprocess(tmp_path: Path):
 def test_main_placeholder_tamper_dropped_not_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    """Inventing/removing placeholders drops the issue; gate does not fail-closed."""
+    """Inventing/removing placeholders drops the issue; gate does not fail-
+    closed."""
     content = """\
 +++ b/a.json
 @@ -0,0 +1 @@
@@ -833,6 +885,48 @@ def test_main_stdout_is_schema_json(
     assert "### Issues" not in captured.err
 
 
+def test_is_daily_quota_error_ignores_rpm_free_tier_metric():
+    """RPM 429 bodies cite generate_content_free_tier_requests without 'per
+    day'."""
+    rpm_body = (
+        '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED",'
+        '"message":"Quota exceeded for metric: '
+        'generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15",'
+        '"details":[{"quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}}'
+    )
+    assert gate.is_daily_quota_error(rpm_body) is False
+    assert gate.is_daily_quota_error(
+        "Quota exceeded for metric: generate_content_free_tier_requests per day"
+    )
+    assert gate.is_daily_quota_error(
+        '{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}'
+    )
+
+
+def test_call_gemini_rpm_free_tier_requests_retries_same_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """RPM 429 must wait-and-retry, not fail over as if RPD were exhausted."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(gate.time, "sleep", lambda s: sleeps.append(s))
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.json.return_value = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+    busy = MagicMock()
+    busy.status_code = 429
+    busy.text = (
+        "Quota exceeded for metric: generate_content_free_tier_requests, "
+        "limit: 15. Please retry in 12.0s."
+    )
+    busy.headers = {}
+    with patch.object(gate.requests, "post", side_effect=[busy, ok]) as post:
+        payload, _duration = gate.call_gemini("key", "prompt")
+        assert payload["candidates"]
+        assert post.call_count == 2
+        assert all(gate.GEMINI_MODELS[0] in c.args[0] for c in post.call_args_list)
+    assert gate.active_model_id() == gate.GEMINI_MODELS[0]
+    assert sleeps and sleeps[0] == 12.0
+
 
 def test_call_gemini_retries_on_429(monkeypatch: pytest.MonkeyPatch):
     sleeps: list[float] = []
@@ -848,9 +942,7 @@ def test_call_gemini_retries_on_429(monkeypatch: pytest.MonkeyPatch):
     )
     busy.headers = {}
 
-    with patch.object(
-        gate.requests, "post", side_effect=[busy, ok]
-    ) as post:
+    with patch.object(gate.requests, "post", side_effect=[busy, ok]) as post:
         payload, _duration = gate.call_gemini("key", "prompt")
         assert payload["candidates"]
         assert post.call_count == 2
@@ -869,9 +961,7 @@ def test_call_gemini_daily_quota_failsover_to_next(monkeypatch: pytest.MonkeyPat
     ok = MagicMock()
     ok.status_code = 200
     ok.json.return_value = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
-    with patch.object(
-        gate.requests, "post", side_effect=[busy, ok]
-    ) as post:
+    with patch.object(gate.requests, "post", side_effect=[busy, ok]) as post:
         payload, _duration = gate.call_gemini("key", "prompt")
         assert payload["candidates"]
         assert post.call_count == 2
@@ -957,9 +1047,25 @@ def test_call_gemini_timeout_retries(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(gate.time, "sleep", lambda _: None)
     with patch.object(
         gate.requests, "post", side_effect=requests.Timeout("boom")
-    ):
+    ) as post:
         with pytest.raises(RuntimeError, match="timeout"):
             gate.call_gemini("key", "prompt")
+        assert post.call_count == len(gate.GEMINI_MODELS) * gate.MAX_ATTEMPTS
+
+
+def test_call_gemini_timeout_failsover_to_next(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(gate.time, "sleep", lambda _: None)
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.json.return_value = {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+    side_effect = [requests.Timeout("boom")] * gate.MAX_ATTEMPTS + [ok]
+    with patch.object(gate.requests, "post", side_effect=side_effect) as post:
+        payload, _duration = gate.call_gemini("key", "prompt")
+        assert payload["candidates"]
+        assert post.call_count == gate.MAX_ATTEMPTS + 1
+        assert gate.GEMINI_MODELS[0] in post.call_args_list[0].args[0]
+        assert gate.GEMINI_MODELS[1] in post.call_args_list[-1].args[0]
+    assert gate.active_model_id() == gate.GEMINI_MODELS[1]
 
 
 def test_analyze_diff_groups_review_by_file():
@@ -1122,6 +1228,7 @@ def test_build_prompt_covers_required_rules():
     assert "VALUE only" in prompt
     assert "placeholders" in prompt.lower()
     assert "whitespace" in prompt.lower()
+    assert "comma splice" in prompt.lower() or "incomplete UI" in prompt
     assert "severity" in prompt
     assert "Chinese character mistakes" in prompt
     assert "wrong characters" in prompt
@@ -1133,6 +1240,8 @@ def test_build_prompt_covers_required_rules():
     # No concrete seed examples (avoid anchoring / token waste).
     assert "Examples:" not in prompt
     assert "神经网路" not in prompt
+    assert "采像" not in prompt
+    assert "成像" not in prompt
     assert "FILE_CAMERA_NOT_SELECT" not in prompt
     assert "FLEX_LIGNT" not in prompt
     assert len(prompt) < 2000
@@ -1168,10 +1277,10 @@ def test_analyze_diff_python_triple_quoted_string():
 
 def test_peek_triple_quoted_skip_contract():
     lines = [
-        '+++ b/t.py',
-        '@@ -1,0 +1,3 @@',
+        "+++ b/t.py",
+        "@@ -1,0 +1,3 @@",
         '+MSG = """',
-        '+hello',
+        "+hello",
         '+"""',
     ]
     skip, value, first = gate._peek_triple_quoted_string(lines, 2, '"""', "")
@@ -1181,7 +1290,10 @@ def test_peek_triple_quoted_skip_contract():
     assert value == "hello"
 
     skip2, value2, first2 = gate._peek_triple_quoted_string(
-        ['+HINT = """Select the camra"""'], 0, '"""', 'Select the camra"""',
+        ['+HINT = """Select the camra"""'],
+        0,
+        '"""',
+        'Select the camra"""',
     )
     # one-liner: no further lines to skip
     assert skip2 == []
@@ -1210,27 +1322,41 @@ def test_pace_after_failover_uses_new_model_interval(monkeypatch: pytest.MonkeyP
     gate.pace_after_model_failover()
     assert sleeps
     assert sleeps[-1] == pytest.approx(
-        gate.min_request_interval_sec(gate.active_model_quota().rpm), rel=1e-3,
+        gate.min_request_interval_sec(gate.active_model_quota().rpm),
+        rel=1e-3,
     )
     assert sleeps[-1] == pytest.approx(12.0, rel=1e-3)
 
 
 def test_assert_generation_complete_rejects_max_tokens():
     with pytest.raises(ValueError, match="finishReason"):
-        gate.assert_generation_complete({
-            "candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "{}"}]}}],
-        })
+        gate.assert_generation_complete(
+            {
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": "{}"}]},
+                    }
+                ],
+            }
+        )
 
 
 def test_with_batch_continuation_header():
-    cont = gate.with_batch_continuation_header("a.py", "mid chunk without header", batch_index=1)
+    cont = gate.with_batch_continuation_header(
+        "a.py", "mid chunk without header", batch_index=1
+    )
     assert cont == "[a.py]\n\nmid chunk without header"
     assert "# file:" not in cont
     assert "# note:" not in cont
     # Already compact — do not add legacy or duplicate headers.
     already = "[a.py:10]\nhello"
-    assert gate.with_batch_continuation_header("a.py", already, batch_index=1) == already
-    assert gate.with_batch_continuation_header("a.py", already, batch_index=0) == already
+    assert (
+        gate.with_batch_continuation_header("a.py", already, batch_index=1) == already
+    )
+    assert (
+        gate.with_batch_continuation_header("a.py", already, batch_index=0) == already
+    )
 
 
 def test_prefers_focused_batches_for_chinese_and_short_files():
@@ -1258,7 +1384,7 @@ def test_focused_max_chunks_per_batch_targets_1_to_3_requests():
     assert gate.focused_max_chunks_per_batch(2) == 2  # → 1 request
     assert gate.focused_max_chunks_per_batch(3) == 2  # → 2 requests
     assert gate.focused_max_chunks_per_batch(18) == 9  # → 2 requests
-    assert gate.focused_max_chunks_per_batch(5) == 3   # → 2 requests
+    assert gate.focused_max_chunks_per_batch(5) == 3  # → 2 requests
     assert gate.FOCUSED_TARGET_BATCHES == 2
 
 
@@ -1287,12 +1413,14 @@ def test_review_by_file_sessions_focused_packs_small_file(
         calls.append(prompt)
         body = {
             "has_issue": True,
-            "issues": [{
-                "original": "已经加入训练序列，前面还有%d个神经网路",
-                "problem": "spelling",
-                "suggestion": "已经加入训练序列，前面还有%d个神经网络",
-                "severity": "high",
-            }],
+            "issues": [
+                {
+                    "original": "已经加入训练序列，前面还有%d个神经网路",
+                    "problem": "spelling",
+                    "suggestion": "已经加入训练序列，前面还有%d个神经网络",
+                    "severity": "high",
+                }
+            ],
         }
         return (
             {"candidates": [{"content": {"parts": [{"text": json.dumps(body)}]}}]},
@@ -1311,7 +1439,8 @@ def test_review_by_file_sessions_focused_packs_small_file(
 
 
 def test_analyze_diff_neighbor_context_keeps_overlapping_views():
-    """Compact VALUE entries still carry file/line; typo VALUE is present once."""
+    """Compact VALUE entries still carry file/line; typo VALUE is present
+    once."""
     diff = """\
 +++ b/translations/chinese.py
 @@ -8,0 +8,4 @@
@@ -1460,7 +1589,56 @@ def test_analyze_diff_python_implicit_string_concat():
     assert "\n2.5D\n" not in review
     # Key appears only in compact header, not as a bare KEY = opener line.
     assert "|GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_" in review
-    assert "GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_CUSTOM_STEPS_TIMEOUT_MS =" not in review
+    assert (
+        "GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_CUSTOM_STEPS_TIMEOUT_MS ="
+        not in review
+    )
+
+
+def test_analyze_diff_python_implicit_concat_includes_context_neighbors():
+    """Partial hunks must review the full KEY = ( implicit-concat VALUE."""
+    first_only = """\
++++ b/shared/config/unitxconfig/translations/english.py
+@@ -181,3 +181,3 @@
+ GLOBAL_CONFIG_DESCRIPTION_DISK_SPACE_AUTO_DELETE_GB = (
+-    "Minimum Free Disk Space (Default: 300GB). When the remaining space falls below this value, "
++    "Minimum Free Disk Space (Default: 300GB). When the remaining space falls below this value, "
+     "the system will automatically delete the oldest image data."
+ )
+"""
+    review = gate.analyze_diff(first_only)["review_text"]
+    assert "When the remaining space falls below this value" in review
+    assert "the system will automatically delete the oldest image data." in review
+    assert review.count("[shared/config/unitxconfig/translations/english.py:") == 1
+
+    second_only = """\
++++ b/shared/config/unitxconfig/translations/english.py
+@@ -191,3 +191,3 @@
+ GLOBAL_CONFIG_DESCRIPTION_DISK_SPACE_HARD_LIMIT_GB = (
+     "When the remaining disk space falls below this value (default 200G), ProdX stops running and prompts "
+-    "that disk space is critically low."
++    "that disk space is critically low."
+ )
+"""
+    review2 = gate.analyze_diff(second_only)["review_text"]
+    assert "ProdX stops running and prompts" in review2
+    assert "that disk space is critically low." in review2
+    assert "the system may not complete processing" not in review2
+
+    timeout_ms = """\
++++ b/shared/config/unitxconfig/translations/english.py
+@@ -205,4 +205,4 @@
+ GLOBAL_CONFIG_DESCRIPTION_IMAGE_PROCESS_TIMEOUT_MS = (
+-    "When there are too many images of 1 part, the processing time can be lengthy, and the system may not complete processing "
++    "When there are too many images of 1 part, the processing time can be lengthy, and the system may not complete processing "
+     "before the camera resets. This value(default 500ms) indicates the tolerance after the camera resets if image "
+     "processing is still not finished. Only when this time is exceeded will it be judged as a processing timeout."
+ )
+"""
+    review3 = gate.analyze_diff(timeout_ms)["review_text"]
+    assert "the system may not complete processing" in review3
+    assert "before the camera resets" in review3
+    assert "processing timeout" in review3
 
 
 def test_filter_value_vs_key_severity():
@@ -1538,10 +1716,82 @@ def test_filter_drops_key_and_syntax_false_positives():
 
     by_original = {i["original"]: i for i in kept}
     assert by_original["FLEX_LIGNT_CONTROL_TITLE"]["severity"] == "low"
-    assert by_original["FLEX_LIGNT_CONTROL_TITLE"]["suggestion"] == "FLEX_LIGHT_CONTROL_TITLE"
+    assert (
+        by_original["FLEX_LIGNT_CONTROL_TITLE"]["suggestion"]
+        == "FLEX_LIGHT_CONTROL_TITLE"
+    )
     assert by_original["File Camera not select"]["severity"] == "high"
-    assert by_original["File Camera not select"]["suggestion"] == "File Camera not selected"
+    assert (
+        by_original["File Camera not select"]["suggestion"]
+        == "File Camera not selected"
+    )
     assert by_original["serial port"]["severity"] == "low"
+
+
+def test_filter_style_wording_forced_to_medium():
+    issues = [
+        {
+            "original": "Deploy Failed, {}",
+            "problem": "The comma after 'Failed' is grammatically incorrect in this context.",
+            "suggestion": "Deploy Failed: {}",
+            "severity": "high",
+        },
+        {
+            "original": "Resetting unknown camera id: {}, please review deployment code.",
+            "problem": "Comma splice error. The two independent clauses should be separated by a semicolon or a period.",
+            "suggestion": "Resetting unknown camera id: {}. Please review deployment code.",
+            "severity": "high",
+        },
+        {
+            "original": "Received unmapped part type ({}), check part_type_map",
+            "problem": "Comma splice error. The two independent clauses should be separated by a semicolon or a period.",
+            "suggestion": "Received unmapped part type ({}). Check part_type_map.",
+            "severity": "high",
+        },
+        {
+            "original": "Software dependency container error. Try restarting or IPC to recovery",
+            "problem": "The phrase 'IPC to recovery' is grammatically incorrect and unclear in this context.",
+            "suggestion": "Software dependency container error. Try restarting or contact support for recovery.",
+            "severity": "high",
+        },
+        {
+            "original": "Minimum Free Disk Space (Default: 300GB). When the remaining space falls below this value,",
+            "problem": "The sentence is incomplete.",
+            "suggestion": "Minimum Free Disk Space (Default: 300GB). When the remaining space falls below this value, the system will trigger an alert.",
+            "severity": "high",
+        },
+        {
+            "original": "When the remaining disk space falls below this value (default 200G), ProdX stops running and prompts",
+            "problem": "The sentence is incomplete.",
+            "suggestion": "When the remaining disk space falls below this value (default 200G), ProdX stops running and prompts the user.",
+            "severity": "high",
+        },
+        {
+            "original": "When there are too many images of 1 part, the processing time can be lengthy, and the system may not complete processing",
+            "problem": "The sentence is incomplete.",
+            "suggestion": "When there are too many images of 1 part, the processing time can be lengthy, and the system may not complete processing in time.",
+            "severity": "high",
+        },
+        {
+            "original": "To ensure HK camera performance matches those of Basler. When enabled, Gamma is applied to the image after capture.",
+            "problem": "Grammar error: 'matches those of' should be 'matches that of' (referring to performance).",
+            "suggestion": "To ensure HK camera performance matches that of Basler. When enabled, Gamma is applied to the image after capture.",
+            "severity": "high",
+        },
+        {
+            "original": "Cencel",
+            "problem": "spelling in UI text",
+            "suggestion": "Cancel",
+            "severity": "high",
+        },
+    ]
+    kept, dropped = gate.filter_userfacing_issues(issues)
+    assert dropped == []
+    by_o = {i["original"]: i for i in kept}
+    style_originals = [i["original"] for i in issues[:-1]]
+    for original in style_originals:
+        assert by_o[original]["severity"] == "medium", original
+    assert by_o["Cencel"]["severity"] == "high"
 
 
 def test_split_into_batches_covers_full_text():

@@ -10,8 +10,8 @@ import requests
 
 from config import (
     DAILY_QUOTA_RE,
-    GEMINI_MODELS,
     GEMINI_MODEL_QUOTAS,
+    GEMINI_MODELS,
     HTTP_TIMEOUT_SEC,
     MAX_ATTEMPTS,
     MAX_QUOTA_RETRIES,
@@ -27,7 +27,9 @@ from config import (
 class GeminiFailoverManager:
     """Sticky model index for quota/availability failover within one process."""
 
-    def __init__(self, quotas: tuple[GeminiModelQuota, ...] = GEMINI_MODEL_QUOTAS) -> None:
+    def __init__(
+        self, quotas: tuple[GeminiModelQuota, ...] = GEMINI_MODEL_QUOTAS
+    ) -> None:
         self._quotas = quotas
         self._index = 0
 
@@ -127,11 +129,27 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
         model_id = active_model_id()
         url = gemini_endpoint(model_id)
         try:
-            response = requests.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT_SEC)
+            response = requests.post(
+                url, json=body, headers=headers, timeout=HTTP_TIMEOUT_SEC
+            )
         except requests.Timeout as exc:
             transient_attempts += 1
             if transient_attempts >= MAX_ATTEMPTS:
-                raise RuntimeError(f"Gemini API timeout after {MAX_ATTEMPTS} attempts") from exc
+                if try_advance_model(
+                    f"timeout after {MAX_ATTEMPTS} attempts on {model_id}"
+                ):
+                    quota_retries = transient_attempts = 0
+                    pace_after_model_failover()
+                    continue
+                raise RuntimeError(
+                    f"Gemini API timeout after {MAX_ATTEMPTS} attempts on all models "
+                    f"({', '.join(GEMINI_MODELS)})"
+                ) from exc
+            print(
+                f"Timeout on {model_id}. "
+                f"Retry {transient_attempts}/{MAX_ATTEMPTS} then failover if still failing",
+                file=sys.stderr,
+            )
             _sleep_transient_backoff(transient_attempts)
             continue
         except requests.RequestException as exc:
@@ -140,10 +158,16 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             try:
                 return response.json(), time.monotonic() - start
             except ValueError as exc:
-                raise RuntimeError(f"Gemini returned non-JSON body: {response.text[:500]}") from exc
+                raise RuntimeError(
+                    f"Gemini returned non-JSON body: {response.text[:500]}"
+                ) from exc
         if response.status_code == 429:
             text = response.text or ""
             if is_daily_quota_error(text):
+                print(
+                    f"HTTP 429 classified as RPD/daily on {model_id}: {text[:400]}",
+                    file=sys.stderr,
+                )
                 if try_advance_model(f"RPD/daily quota exhausted on {model_id}"):
                     quota_retries = transient_attempts = 0
                     pace_after_model_failover()
@@ -156,7 +180,9 @@ def call_gemini(api_key: str, prompt: str) -> tuple[dict[str, Any], float]:
             wait = parse_retry_after_seconds(response)
             quota_retries += 1
             if quota_retries > MAX_QUOTA_RETRIES:
-                if try_advance_model(f"RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} waits on {model_id}"):
+                if try_advance_model(
+                    f"RPM/TPM still exhausted after {MAX_QUOTA_RETRIES} waits on {model_id}"
+                ):
                     quota_retries = transient_attempts = 0
                     pace_after_model_failover()
                     continue

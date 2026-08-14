@@ -1,5 +1,8 @@
 [
   {"original": "过杀"},
+  {"original": "漏杀"},
   {"original": "产线机"},
-  {"original": "漏杀"}
+  {"original": "训练机"},
+  {"original": "采像"},
+  {"original": "IPC"}
 ]

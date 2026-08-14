@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TypedDict
 
 
 class Issue(TypedDict, total=False):
     original: str
     problem: str
     suggestion: str
-    severity: str          # 'high', 'medium', 'low'
+    severity: str  # 'high', 'medium', 'low'
     file: str | None
     line: int | None
     # internal fields used during processing

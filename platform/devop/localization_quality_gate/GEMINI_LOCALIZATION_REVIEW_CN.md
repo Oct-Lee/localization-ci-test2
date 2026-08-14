@@ -9,7 +9,9 @@ PR 用户可见文本（English / Simplified Chinese / Portuguese）质量门禁
 | 组件 | 路径 |
 | --- | --- |
 | Workflow（路径白名单唯一数据源） | [`.github/workflows/localization-quality-gate.yml`](../../../.github/workflows/localization-quality-gate.yml) |
-| 审查脚本 | [`localization_quality_gate.py`](./localization_quality_gate.py) |
+| CLI 入口（facade） | [`localization_quality_gate.py`](./localization_quality_gate.py) |
+| 实现模块 | [`config.py`](./config.py)、[`diff_parser.py`](./diff_parser.py)、[`gemini_client.py`](./gemini_client.py)、[`review_batcher.py`](./review_batcher.py)、[`response_processor.py`](./response_processor.py)、[`report_formatter.py`](./report_formatter.py)、[`models.py`](./models.py) |
+| 误报白名单 | [`allowlist.json`](./allowlist.json) |
 | 单元测试 | [`test_localization_quality_gate.py`](./test_localization_quality_gate.py) |
 
 ## Secret
@@ -110,7 +112,7 @@ Exit：
 ]
 ```
 
-- `original`：必填，与 issue 的 VALUE **完全一致**
+- `original`：必填；整句 VALUE 一致，或 VALUE 内含该术语（中文子串如「采像」；英文按整词，如 `IPC` 不匹配 `IPConfig`）
 - `file`：可选；有则路径相等或以该后缀结尾才忽略
 
 ## 模型 failover
@@ -129,7 +131,7 @@ Key 经 `x-goog-api-key` header 传递。
 
 ## 查看结果与 Required Check
 
-1. PR → **Checks** → `Localization Quality Gate`
+1. PR → **Checks** → `Localization Quality Gate` / `Localization Quality Gate Required`
 2. Job log 看 JSON；**Summary** 看 Markdown 报告
 
-分支保护 Require status checks 勾选：**`Localization Quality Gate`**（与 workflow `name` 一致）。
+分支保护 Require status checks 勾选：**`Localization Quality Gate Required`**（与 required 聚合 job 的 `name` 一致）。
