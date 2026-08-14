@@ -3,7 +3,7 @@ IMPORT_PROJECT_ERROR_INVALID_IMPORTED_VERSION = "The imported project's Cortex v
 IMPORT_PROJECT_ERROR_PICKLING_ERROR = (
     "Error importing: please check if the file is corrupted or damaged."
 )
-CAMERA_NOT_FOUND_ERROR = "camera[{camera_id}] not Founded，Please check whether the 'camera_id' parameter off the configration file is correct"
+CAMERA_NOT_FOUND_ERROR = "Camera [{camera_id}] not found. Please check whether the 'camera_id' parameter of the configuration file is correct"
 POSTGRES_CONNECT_OTHER = "Database port 5432 is error. Check port status and retry"
 DOCKER_CONTAINER_NOT_RUNNING = "Software dependency container error. Try restarting the software or IPC to recovery"
 ERROR_FILE_PROPERTIES_NOT_FOUND = "{} not existed"

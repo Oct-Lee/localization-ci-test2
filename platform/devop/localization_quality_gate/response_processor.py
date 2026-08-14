@@ -7,28 +7,32 @@ import re
 import sys
 from typing import Any
 
+from diff_parser import extract_user_facing_hints
+from models import Issue
+
 from config import (
+    _COMPLETE_FINISH_REASONS,
+    _ID_PROBLEM_TOKENS,
+    _PUNCT_ONLY_RE,
+    _SEVERITY_RANK,
+    _STYLE_WORDING_PROBLEM_RE,
+    _WS_PROBLEM_RE,
     ALLOWLIST_PATH,
     ASSIGNMENT_LINE_RE,
+    FENCE_RE,
     JSON_KV_RE,
     KEY_ASSIGN_PREFIX_RE,
     KEY_ONLY_RE,
     PLACEHOLDER_RE,
+    PROP_KEY,
     SEVERITY_HIGH,
     SEVERITY_LOW,
     SEVERITY_MEDIUM,
     STRING_VALUE_LINE_RE,
     SYNTAX_PROBLEM_RE,
     VALID_SEVERITIES,
-    _ID_PROBLEM_TOKENS,
-    _SEVERITY_RANK,
-    _WS_PROBLEM_RE,
-    FENCE_RE,
-    PROP_KEY,
-    _COMPLETE_FINISH_REASONS,
 )
-from diff_parser import extract_user_facing_hints
-from models import Issue
+
 
 # ---- Helper functions ----
 def strip_markdown_fence(text: str) -> str:
@@ -51,12 +55,14 @@ def assert_generation_complete(api_payload: dict[str, Any]) -> None:
 
 
 def extract_response_text(api_payload: dict[str, Any]) -> str:
-    """Extract text from Gemini response payload, ensuring generation complete."""
+    """Extract text from Gemini response payload, ensuring generation
+    complete."""
     assert_generation_complete(api_payload)
     try:
         return api_payload["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"Unexpected Gemini response shape: {exc}") from exc
+
 
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
@@ -90,7 +96,9 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         severity = issue["severity"].strip().lower()
         if severity not in VALID_SEVERITIES:
-            skipped_reasons.append(f"issues[{i}]: invalid severity {issue['severity']!r}")
+            skipped_reasons.append(
+                f"issues[{i}]: invalid severity {issue['severity']!r}"
+            )
             continue
         item: Issue = {
             "original": issue["original"],
@@ -119,6 +127,7 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         has_issue = True
     return {"has_issue": has_issue, "issues": validated_issues}
 
+
 def parse_model_json(raw_text: str) -> dict[str, Any]:
     cleaned = strip_markdown_fence(raw_text)
     try:
@@ -126,6 +135,7 @@ def parse_model_json(raw_text: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON from model: {exc}") from exc
     return validate_result(payload)
+
 
 def normalize_issue_to_string_value(issue: Issue) -> Issue:
     out = dict(issue)
@@ -135,7 +145,9 @@ def normalize_issue_to_string_value(issue: Issue) -> Issue:
     s_m = ASSIGNMENT_LINE_RE.match(suggestion_raw)
     if o_m and s_m:
         if o_m.group(1) != s_m.group(1):
-            out.update(original=o_m.group(1), suggestion=s_m.group(1), _kind="identifier")
+            out.update(
+                original=o_m.group(1), suggestion=s_m.group(1), _kind="identifier"
+            )
             return out
         out.update(original=o_m.group(3), suggestion=s_m.group(3), _kind="value")
         return out
@@ -154,6 +166,7 @@ def normalize_issue_to_string_value(issue: Issue) -> Issue:
     out["suggestion"] = suggestion_raw
     return out
 
+
 def looks_like_code_key(text: str) -> bool:
     s = text.strip().rstrip(",").rstrip(":")
     if not s or not re.match(rf"^{PROP_KEY}$", s):
@@ -161,6 +174,7 @@ def looks_like_code_key(text: str) -> bool:
     if "_" in s or (s.isupper() and len(s) >= 3) or re.match(r"^[a-z]+[A-Z]", s):
         return True
     return False
+
 
 def is_identifier_issue(issue: Issue) -> bool:
     if issue.get("_kind") == "identifier":
@@ -178,13 +192,32 @@ def is_identifier_issue(issue: Issue) -> bool:
         return o_key != s_key
     return False
 
+
 def is_whitespace_style_issue(issue: Issue) -> bool:
     if _WS_PROBLEM_RE.search(issue.get("problem", "") or ""):
         return True
     original, suggestion = issue.get("original", ""), issue.get("suggestion", "")
-    if original and suggestion and original != suggestion and original.strip() == suggestion.strip():
+    if (
+        original
+        and suggestion
+        and original != suggestion
+        and original.strip() == suggestion.strip()
+    ):
         return True
     return False
+
+
+def is_style_wording_issue(issue: Issue) -> bool:
+    """Punctuation / wording preference — not a blocking misspelling."""
+    if _STYLE_WORDING_PROBLEM_RE.search(issue.get("problem", "") or ""):
+        return True
+    original, suggestion = issue.get("original", ""), issue.get("suggestion", "")
+    if not original or not suggestion or original == suggestion:
+        return False
+    return _PUNCT_ONLY_RE.sub(" ", original).strip().lower() == _PUNCT_ONLY_RE.sub(
+        " ", suggestion
+    ).strip().lower()
+
 
 def is_syntax_false_positive(issue: Issue) -> bool:
     original = issue.get("original", "").strip()
@@ -210,12 +243,17 @@ def is_syntax_false_positive(issue: Issue) -> bool:
             return True
     return False
 
+
 def filter_userfacing_issues(
-    issues: list[Issue], *, already_normalized: bool = False,
+    issues: list[Issue],
+    *,
+    already_normalized: bool = False,
 ) -> tuple[list[Issue], list[Issue]]:
     kept, dropped = [], []
     for issue in issues:
-        normalized = issue if already_normalized else normalize_issue_to_string_value(issue)
+        normalized = (
+            issue if already_normalized else normalize_issue_to_string_value(issue)
+        )
         if is_syntax_false_positive(normalized):
             dropped.append(issue)
             continue
@@ -224,14 +262,21 @@ def filter_userfacing_issues(
             continue
         if is_identifier_issue(normalized) or is_whitespace_style_issue(normalized):
             normalized["severity"] = SEVERITY_LOW
+        elif (
+            normalized.get("severity") == SEVERITY_HIGH
+            and is_style_wording_issue(normalized)
+        ):
+            normalized["severity"] = SEVERITY_MEDIUM
         normalized.pop("_kind", None)
         normalized.pop("_recover_original", None)
         normalized.pop("_key_name", None)
         kept.append(normalized)
     return kept, dropped
 
+
 def placeholders(text: str) -> set[str]:
     return set(PLACEHOLDER_RE.findall(text))
+
 
 def filter_placeholder_mismatches(
     issues: list[Issue],
@@ -244,6 +289,7 @@ def filter_placeholder_mismatches(
             kept.append(issue)
     return kept, dropped
 
+
 def load_allowlist(path=None) -> list[dict[str, str]]:
     allowlist_path = path if path is not None else ALLOWLIST_PATH
     if not allowlist_path.is_file():
@@ -251,10 +297,14 @@ def load_allowlist(path=None) -> list[dict[str, str]]:
     try:
         raw = json.loads(allowlist_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        print(f"Allowlist ignored (unreadable): {allowlist_path}: {exc}", file=sys.stderr)
+        print(
+            f"Allowlist ignored (unreadable): {allowlist_path}: {exc}", file=sys.stderr
+        )
         return []
     if not isinstance(raw, list):
-        print(f"Allowlist ignored (root must be array): {allowlist_path}", file=sys.stderr)
+        print(
+            f"Allowlist ignored (root must be array): {allowlist_path}", file=sys.stderr
+        )
         return []
     entries: list[dict[str, str]] = []
     for item in raw:
@@ -270,10 +320,32 @@ def load_allowlist(path=None) -> list[dict[str, str]]:
         entries.append(entry)
     return entries
 
+
 def _allowlist_file_match(issue_file: str, allow_file: str) -> bool:
     issue_file = (issue_file or "").replace("\\", "/")
     allow_file = allow_file.replace("\\", "/")
     return issue_file == allow_file or issue_file.endswith("/" + allow_file)
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def allowlist_original_matches(issue_original: str, allow_original: str) -> bool:
+    """Exact VALUE, or domain term inside VALUE (CJK substring / ASCII word)."""
+    if not issue_original or not allow_original:
+        return False
+    if issue_original == allow_original:
+        return True
+    if _CJK_RE.search(allow_original):
+        return allow_original in issue_original
+    return (
+        re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(allow_original)}(?![A-Za-z0-9_])",
+            issue_original,
+        )
+        is not None
+    )
+
 
 def is_allowlisted(issue: Issue, entries: list[dict[str, str]]) -> bool:
     original = issue.get("original")
@@ -281,15 +353,17 @@ def is_allowlisted(issue: Issue, entries: list[dict[str, str]]) -> bool:
         return False
     issue_file = str(issue.get("file") or "")
     for entry in entries:
-        if entry["original"] != original:
+        if not allowlist_original_matches(original, entry["original"]):
             continue
         allow_file = entry.get("file")
         if not allow_file or _allowlist_file_match(issue_file, allow_file):
             return True
     return False
 
+
 def filter_allowlisted(
-    issues: list[Issue], entries: list[dict[str, str]] | None = None,
+    issues: list[Issue],
+    entries: list[dict[str, str]] | None = None,
 ) -> tuple[list[Issue], list[Issue]]:
     allow = entries if entries is not None else load_allowlist()
     if not allow:
@@ -301,6 +375,7 @@ def filter_allowlisted(
         else:
             kept.append(issue)
     return kept, dropped
+
 
 def dedupe_issues(issues: list[Issue]) -> list[Issue]:
     best: dict[tuple[Any, ...], Issue] = {}
@@ -317,9 +392,12 @@ def dedupe_issues(issues: list[Issue]) -> list[Issue]:
             best[key] = issue
             order.append(key)
             continue
-        if _SEVERITY_RANK.get(issue.get("severity"), 0) > _SEVERITY_RANK.get(prev.get("severity"), 0):
+        if _SEVERITY_RANK.get(issue.get("severity"), 0) > _SEVERITY_RANK.get(
+            prev.get("severity"), 0
+        ):
             best[key] = issue
     return [best[k] for k in order]
+
 
 def _value_exact_in_line(needle: str, text: str) -> bool:
     stripped = text.strip().rstrip(",").strip()
@@ -333,8 +411,10 @@ def _value_exact_in_line(needle: str, text: str) -> bool:
         return m.group(2) == needle
     return False
 
+
 def attach_locations(
-    issues: list[Issue], added_details: dict[str, list[dict[str, Any]]],
+    issues: list[Issue],
+    added_details: dict[str, list[dict[str, Any]]],
 ) -> list[Issue]:
     enriched = []
     for issue in issues:
@@ -347,13 +427,17 @@ def attach_locations(
         if out.get("file") and isinstance(out.get("line"), int) and out["line"] > 0:
             enriched.append(out)
             continue
-        paths = [out["file"]] if out.get("file") in added_details else list(added_details)
+        paths = (
+            [out["file"]] if out.get("file") in added_details else list(added_details)
+        )
         exact, soft = [], []
         for path in paths:
             for row in added_details.get(path, []):
                 text = row["text"]
                 hit = (path, row["line"])
-                if _value_exact_in_line(raw, text) or _value_exact_in_line(needle, text):
+                if _value_exact_in_line(raw, text) or _value_exact_in_line(
+                    needle, text
+                ):
                     exact.append(hit)
                 elif f'"{needle}"' in text or f"'{needle}'" in text:
                     soft.append(hit)
@@ -364,6 +448,7 @@ def attach_locations(
             out["file"], out["line"] = hits[0]
         enriched.append(out)
     return enriched
+
 
 def _lookup_added_value(
     added_details: dict[str, list[dict[str, Any]]],
@@ -390,14 +475,18 @@ def _lookup_added_value(
                         return hints[0], row.get("line")
     return None, None
 
+
 def recover_key_prefix_originals(
-    issues: list[Issue], added_details: dict[str, list[dict[str, Any]]],
+    issues: list[Issue],
+    added_details: dict[str, list[dict[str, Any]]],
 ) -> list[Issue]:
     recovered = []
     for issue in issues:
         out = dict(issue)
         orig = (out.get("original") or "").strip()
-        need = out.pop("_recover_original", False) or bool(KEY_ASSIGN_PREFIX_RE.match(orig))
+        need = out.pop("_recover_original", False) or bool(
+            KEY_ASSIGN_PREFIX_RE.match(orig)
+        )
         if not need:
             recovered.append(out)
             continue
@@ -405,11 +494,16 @@ def recover_key_prefix_originals(
         if not key_name and (m := KEY_ASSIGN_PREFIX_RE.match(orig)):
             key_name = m.group(1)
         value, found_line = _lookup_added_value(
-            added_details, out.get("file"), out.get("line"), key_name,
+            added_details,
+            out.get("file"),
+            out.get("line"),
+            key_name,
         )
         if value is not None:
             out["original"] = value
-            if found_line and (not isinstance(out.get("line"), int) or out.get("line", -1) <= 0):
+            if found_line and (
+                not isinstance(out.get("line"), int) or out.get("line", -1) <= 0
+            ):
                 out["line"] = found_line
             sugg = out.get("suggestion", "")
             if not sugg or KEY_ASSIGN_PREFIX_RE.match(sugg.strip()):
@@ -418,7 +512,9 @@ def recover_key_prefix_originals(
     return recovered
 
 
-def _log_filtered(dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False) -> None:
+def _log_filtered(
+    dropped: list[dict[str, Any]], label: str, *, show_samples: bool = False
+) -> None:
     if not dropped:
         return
     print(f"Filtered {len(dropped)} {label}", file=sys.stderr)
@@ -438,8 +534,9 @@ def postprocess_issues(
 ) -> list[Issue]:
     """Post-process model issues.
 
-    If allowlist_entries is provided, use it; otherwise call load_allowlist().
-    Façade may pass entries so tests can patch load_allowlist on the entry module.
+    If allowlist_entries is provided, use it; otherwise call
+    load_allowlist(). Façade may pass entries so tests can patch
+    load_allowlist on the entry module.
     """
     issues = attach_locations(issues, added_details)
     normalized = [normalize_issue_to_string_value(i) for i in issues]

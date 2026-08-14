@@ -10,6 +10,8 @@ from collections import OrderedDict
 from typing import Any
 
 from config import (
+    _LOCALE_LANG_KEYS,
+    _STRUCT_TOKENS,
     ASSIGNMENT_LINE_RE,
     HUNK_RE,
     JSON_KV_RE,
@@ -22,9 +24,8 @@ from config import (
     SKIP_LINE_RE,
     STRING_VALUE_LINE_RE,
     STRUCT_OPEN_RE,
-    _LOCALE_LANG_KEYS,
-    _STRUCT_TOKENS,
 )
+
 
 # ===== Helper functions =====
 def _json_unescape(value: str) -> str:
@@ -38,14 +39,17 @@ def _json_unescape(value: str) -> str:
             .replace(r"\t", "\t")
         )
 
+
 def _looks_like_user_facing_locale_key(key: str) -> bool:
     if any(ord(c) > 127 for c in key):
         return True
     return " " in key and not key.startswith("msg.") and "." not in key.split(" ")[0]
 
+
 def should_skip_review_line(text: str) -> bool:
     stripped = text.strip()
     return not stripped or SKIP_LINE_RE.match(stripped) or stripped in _STRUCT_TOKENS
+
 
 def parse_i18n_csv_row(text: str) -> tuple[str, list[str]] | None:
     try:
@@ -65,6 +69,7 @@ def parse_i18n_csv_row(text: str) -> tuple[str, list[str]] | None:
         return None
     return key, values
 
+
 def extract_nested_locale_values(text: str) -> tuple[str, list[str]] | None:
     m = NESTED_LOCALE_OBJECT_RE.match(text.strip())
     if not m:
@@ -78,6 +83,7 @@ def extract_nested_locale_values(text: str) -> tuple[str, list[str]] | None:
     if not values:
         return None
     return key, values
+
 
 def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
     stripped = text.strip()
@@ -101,13 +107,10 @@ def extract_user_facing_hints(text: str, path: str = "") -> list[str]:
             return list(parsed[1])
     return []
 
+
 def _escape_review_value(value: str) -> str:
     """Escape embedded newlines in a VALUE for compact Gemini payload."""
-    return (
-        value.replace("\r\n", "\\n")
-        .replace("\r", "\\n")
-        .replace("\n", "\\n")
-    )
+    return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
 
 
 def _compact_review_entry(
@@ -130,30 +133,39 @@ def _compact_review_entry(
 
 
 def _peek_multiline_string_value(
-    lines: list[str], start_idx: int, *, concatenate: bool = False, max_scan: int | None = None,
+    lines: list[str],
+    start_idx: int,
+    *,
+    concatenate: bool = False,
+    max_scan: int | None = None,
 ) -> tuple[list[int], str, int] | None:
     skip, parts, first_value_idx = [], [], None
     end = len(lines) if max_scan is None else min(len(lines), start_idx + 1 + max_scan)
     for j in range(start_idx + 1, end):
         candidate = lines[j]
-        if candidate.startswith(("---", "+++", "@@")) or (candidate.startswith(" ") and parts):
+        if candidate.startswith(("---", "+++", "@@")):
             break
         if candidate.startswith("-"):
             continue
-        if candidate.startswith(" ") and not parts:
-            continue
-        if not candidate.startswith("+"):
+        is_ctx, is_add = candidate.startswith(" "), candidate.startswith("+")
+        if not is_ctx and not is_add:
+            break
+        if is_ctx and not concatenate and parts:
             break
         value_text = candidate[1:]
         stripped = value_text.strip()
         if parts and stripped in {")", "),"}:
-            skip.append(j)
+            if is_add:
+                skip.append(j)
             break
         if not (match := STRING_VALUE_LINE_RE.match(value_text)):
+            if is_ctx and not parts:
+                continue
             break
         if first_value_idx is None:
             first_value_idx = j
-        skip.append(j)
+        if is_add:
+            skip.append(j)
         parts.append(match.group(2))
         if not concatenate:
             break
@@ -162,8 +174,30 @@ def _peek_multiline_string_value(
     return skip, "".join(parts), first_value_idx
 
 
+def _find_python_concat_opener(lines: list[str], idx: int) -> int | None:
+    """Walk back from a quoted fragment to a KEY = ( opener."""
+    for j in range(idx - 1, -1, -1):
+        raw = lines[j]
+        if raw.startswith(("---", "+++", "@@")):
+            return None
+        if raw.startswith("-"):
+            continue
+        if not raw.startswith(("+", " ")):
+            return None
+        text = raw[1:]
+        if PY_KEY_OPEN_RE.match(text):
+            return j
+        if STRING_VALUE_LINE_RE.match(text) or not text.strip():
+            continue
+        return None
+    return None
+
+
 def _peek_triple_quoted_string(
-    lines: list[str], start_idx: int, quote: str, rest: str,
+    lines: list[str],
+    start_idx: int,
+    quote: str,
+    rest: str,
 ) -> tuple[list[int], str, int] | None:
     pieces: list[str] = []
     skip: list[int] = []
@@ -222,7 +256,10 @@ def process_triple_quote_string(
     review_by_file: OrderedDict[str, list[str]],
 ) -> bool:
     merged = _peek_triple_quoted_string(
-        lines, idx, triple.group("q"), triple.group("rest"),
+        lines,
+        idx,
+        triple.group("q"),
+        triple.group("rest"),
     )
     if merged is None:
         return False
@@ -231,11 +268,19 @@ def process_triple_quote_string(
     value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
     key_name = triple.group(1)
     chunk = _compact_review_entry(
-        path_label, value_line_no, [string_val], key_name=key_name,
+        path_label,
+        value_line_no,
+        [string_val],
+        key_name=key_name,
     )
     dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
     add_chunk_if_new(
-        seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+        seen,
+        review_chunks,
+        review_by_file,
+        path_label,
+        dedupe_key,
+        chunk,
     )
     return True
 
@@ -262,17 +307,70 @@ def process_multiline_value(
     value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
     key_name = (key_only or py_open).group(1)
     chunk = _compact_review_entry(
+        path_label,
+        value_line_no,
+        [string_val],
+        key_name=key_name,
+    )
+    dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
+    add_chunk_if_new(
+        seen,
+        review_chunks,
+        review_by_file,
+        path_label,
+        dedupe_key,
+        chunk,
+    )
+    return "consumed"
+
+
+def process_implicit_concat_fragment(
+    lines: list[str],
+    idx: int,
+    text: str,
+    line_no: int,
+    path_label: str,
+    skip_indices: set[int],
+    seen: set[str],
+    review_chunks: list[str],
+    review_by_file: OrderedDict[str, list[str]],
+) -> bool:
+    """Join a +quoted fragment with unchanged KEY = ( neighbors.
+
+    Diffs often change only one implicit-concat line; without neighbors the
+    VALUE looks like an incomplete sentence to the model.
+    """
+    current = STRING_VALUE_LINE_RE.match(text)
+    if not current:
+        return False
+    opener_idx = _find_python_concat_opener(lines, idx)
+    if opener_idx is None:
+        return False
+    opener_match = PY_KEY_OPEN_RE.match(lines[opener_idx][1:])
+    if not opener_match:
+        return False
+    merged = _peek_multiline_string_value(lines, opener_idx, concatenate=True)
+    if not merged:
+        return False
+    skip_idxs, string_val, first_value_idx = merged
+    if string_val == current.group(2):
+        return False
+    skip_indices.update(skip_idxs)
+    value_line_no = line_no + (first_value_idx - idx) if line_no >= 0 else -1
+    key_name = opener_match.group(1)
+    chunk = _compact_review_entry(
         path_label, value_line_no, [string_val], key_name=key_name,
     )
     dedupe_key = f"{path_label}:{value_line_no}:{key_name}:{string_val}"
     add_chunk_if_new(
         seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
     )
-    return "consumed"
+    return True
 
 
 def extract_user_facing_from_line(
-    text: str, path_label: str,
+    text: str,
+    path_label: str,
 ) -> tuple[list[str], str | None] | None:
     hints: list[str] = []
     key_name: str | None = None
@@ -322,7 +420,12 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
 
     def ensure_file(path: str) -> dict[str, Any]:
         if path not in files_map:
-            files_map[path] = {"path": path, "added": 0, "deleted": 0, "added_lines": []}
+            files_map[path] = {
+                "path": path,
+                "added": 0,
+                "deleted": 0,
+                "added_lines": [],
+            }
             files_order.append(path)
         return files_map[path]
 
@@ -354,15 +457,41 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             path_label = current_file or "(unknown)"
             if triple := PY_TRIPLE_OPEN_RE.match(text):
                 if process_triple_quote_string(
-                    lines, idx, line_no, path_label, triple,
-                    skip_indices, seen, review_chunks, review_by_file,
+                    lines,
+                    idx,
+                    line_no,
+                    path_label,
+                    triple,
+                    skip_indices,
+                    seen,
+                    review_chunks,
+                    review_by_file,
                 ):
                     continue
             multiline = process_multiline_value(
-                lines, idx, text, line_no, path_label,
-                skip_indices, seen, review_chunks, review_by_file,
+                lines,
+                idx,
+                text,
+                line_no,
+                path_label,
+                skip_indices,
+                seen,
+                review_chunks,
+                review_by_file,
             )
             if multiline in ("consumed", "skip"):
+                continue
+            if process_implicit_concat_fragment(
+                lines,
+                idx,
+                text,
+                line_no,
+                path_label,
+                skip_indices,
+                seen,
+                review_chunks,
+                review_by_file,
+            ):
                 continue
             if should_skip_review_line(text):
                 continue
@@ -373,11 +502,19 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
                 continue
             hints, key_name = extracted
             chunk = _compact_review_entry(
-                path_label, line_no, hints, key_name=key_name,
+                path_label,
+                line_no,
+                hints,
+                key_name=key_name,
             )
             dedupe_key = f"{path_label}:{line_no}:{chunk}"
             add_chunk_if_new(
-                seen, review_chunks, review_by_file, path_label, dedupe_key, chunk,
+                seen,
+                review_chunks,
+                review_by_file,
+                path_label,
+                dedupe_key,
+                chunk,
             )
             continue
         if line.startswith("-") and not line.startswith("---"):
@@ -387,7 +524,11 @@ def analyze_diff(diff_text: str) -> dict[str, Any]:
             new_line_no += 1
 
     files_out = [
-        {"path": files_map[p]["path"], "added": files_map[p]["added"], "deleted": files_map[p]["deleted"]}
+        {
+            "path": files_map[p]["path"],
+            "added": files_map[p]["added"],
+            "deleted": files_map[p]["deleted"],
+        }
         for p in files_order
     ]
     review_by_file_text = {p: "\n\n".join(c) for p, c in review_by_file.items() if c}

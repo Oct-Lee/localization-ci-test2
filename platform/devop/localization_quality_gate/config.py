@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import NamedTuple
-import re
+
 
 # ===== Model Quotas =====
 class GeminiModelQuota(NamedTuple):
@@ -13,11 +14,12 @@ class GeminiModelQuota(NamedTuple):
     rpd: int
     tpm: int | None = None
 
+
 GEMINI_MODEL_QUOTAS: tuple[GeminiModelQuota, ...] = (
-    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.1-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3.5-flash-lite", rpm=15, rpd=500, tpm=250_000),
     GeminiModelQuota("gemini-3-flash-preview", rpm=5, rpd=20, tpm=250_000),
+    GeminiModelQuota("gemini-3.5-flash", rpm=5, rpd=20, tpm=250_000),
     GeminiModelQuota("gemini-3.6-flash", rpm=5, rpd=20, tpm=250_000),
 )
 GEMINI_MODELS = tuple(q.model_id for q in GEMINI_MODEL_QUOTAS)
@@ -47,14 +49,19 @@ _FOCUSED_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+# Only true daily-quota signals. Do NOT match generate_content_free_tier_requests
+# alone — Google uses that metric for both RPM and RPD; RPM 429s include it too.
 DAILY_QUOTA_RE = re.compile(
-    r"per\s*day|daily\s*quota|rpd|free_tier_requests|generate_content_free_tier_requests",
+    r"per\s*day|daily\s*quota|\brpd\b|requests?\s*per\s*day|"
+    r"GenerateRequestsPerDay|QuotaId[^\n]*PerDay",
     re.IGNORECASE,
 )
 
 # ===== Regular expressions =====
 PLACEHOLDER_RE = re.compile(r"\{[^}]*\}|%\w|\$\{[^}]*\}")
-FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
+FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE
+)
 PROP_KEY = r"[A-Za-z_][A-Za-z0-9_]*"
 KEY_ONLY_RE = re.compile(rf"^{PROP_KEY}\s*:?\s*,?\s*$")
 KEY_ONLY_LINE_RE = re.compile(rf"^\s*({PROP_KEY})\s*:\s*$")
@@ -62,26 +69,40 @@ KEY_ASSIGN_PREFIX_RE = re.compile(rf"^\s*({PROP_KEY})\s*[:=]\s*$")
 PY_KEY_OPEN_RE = re.compile(rf"^\s*([A-Z][A-Z0-9_]*)\s*=\s*\(\s*$")
 STRUCT_OPEN_RE = re.compile(rf"^\s*{PROP_KEY}\s*:\s*[{{\[]\s*,?\s*$")
 QUOTED_KEY_STRUCT_OPEN_RE = re.compile(
-    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{\s*,?\s*$'''
+    r"""^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{\s*,?\s*$"""
 )
 NESTED_LOCALE_OBJECT_RE = re.compile(
-    r'''^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{(?P<body>.*)\}\s*,?\s*$'''
+    r"""^\s*"(?P<key>(?:\\.|[^"\\])*)"\s*:\s*\{(?P<body>.*)\}\s*,?\s*$"""
 )
 NESTED_LOCALE_PAIR_RE = re.compile(
     r'''"(?P<lang>(?:\\.|[^"\\])*)"\s*:\s*"(?P<val>(?:\\.|[^"\\])*)"'''
 )
-_LOCALE_LANG_KEYS = frozenset({
-    "en", "zh", "pt", "en-us", "zh-cn", "pt-pt", "pt-br", "zh-hans", "zh-hant",
-    "english", "chinese", "portuguese",
-})
+_LOCALE_LANG_KEYS = frozenset(
+    {
+        "en",
+        "zh",
+        "pt",
+        "en-us",
+        "zh-cn",
+        "pt-pt",
+        "pt-br",
+        "zh-hans",
+        "zh-hant",
+        "english",
+        "chinese",
+        "portuguese",
+    }
+)
 PY_TRIPLE_OPEN_RE = re.compile(
     rf"""^\s*({PROP_KEY})\s*=\s*[fFrRbBuU]*(?P<q>\"\"\"|''')(?P<rest>.*)$"""
 )
-STRING_VALUE_LINE_RE = re.compile(
-    r"""^\s*(['"])((?:\\.|(?!\1)[^\r\n])*)\1\s*,?\s*$"""
+STRING_VALUE_LINE_RE = re.compile(r"""^\s*(['"])((?:\\.|(?!\1)[^\r\n])*)\1\s*,?\s*$""")
+ASSIGNMENT_LINE_RE = re.compile(
+    rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""", re.DOTALL
 )
-ASSIGNMENT_LINE_RE = re.compile(rf"""^\s*({PROP_KEY})\s*[:=]\s*(['"])(.*)\2\s*,?\s*$""", re.DOTALL)
-JSON_KV_RE = re.compile(r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$""")
+JSON_KV_RE = re.compile(
+    r"""^\s*"((?:\\.|[^"\\])*)"\s*:\s*"((?:\\.|[^"\\])*)"\s*,?\s*$"""
+)
 SKIP_LINE_RE = re.compile(
     r"""(?x)^\s*(?:import\b|from\b|export\s+default\b|export\s+const\b|
     const\s+\w+\s*=\s*\{|/\*|^\s*\*|^\s*//|\}|\{|,|\#)"""
@@ -98,11 +119,26 @@ _WS_PROBLEM_RE = re.compile(
     r"前导空格|尾随空格|首尾空格",
     re.IGNORECASE,
 )
+# Wording/punctuation nits — keep visible but never block merge as HIGH.
+_STYLE_WORDING_PROBLEM_RE = re.compile(
+    r"comma\s+splice|incomplete\s+sentence|sentence is incomplete|"
+    r"grammatically|"
+    r"comma after|colon after|"
+    r"matches those of|matches that of|"
+    r"unclear in this context|IPC to recovery",
+    re.IGNORECASE,
+)
+_PUNCT_ONLY_RE = re.compile(r"[\s,;:]+")
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _STRUCT_TOKENS = frozenset(("{", "}", "},", "[", "],", "];", "};", ")", "),", "("))
 _ID_PROBLEM_TOKENS = (
-    "identifier", "constant name", "key name", "object key", "property name",
-    "variable name", "key typo",
+    "identifier",
+    "constant name",
+    "key name",
+    "object key",
+    "property name",
+    "variable name",
+    "key typo",
 )
 _COMPLETE_FINISH_REASONS = frozenset({"STOP", "stop", "FINISH_REASON_STOP"})
 
@@ -120,7 +156,10 @@ _ISSUE_SCHEMA: dict = {
         "original": {"type": "STRING"},
         "problem": {"type": "STRING"},
         "suggestion": {"type": "STRING"},
-        "severity": {"type": "STRING", "enum": ["high", "medium", "low"]},
+        "severity": {
+            "type": "STRING",
+            "enum": [SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW],
+        },
     },
     "required": ["original", "problem", "suggestion", "severity"],
 }
@@ -133,9 +172,11 @@ RESPONSE_SCHEMA: dict = {
     "required": ["has_issue", "issues"],
 }
 
+
 # ===== Endpoint helper =====
 def gemini_endpoint(model_id: str) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+
 
 # ===== Rate limit interval helper =====
 def min_request_interval_sec(rpm: int | None = None) -> float:

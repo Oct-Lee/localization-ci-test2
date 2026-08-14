@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Localization Quality Gate — CLI entry / test façade.
 
-When run as a script, sibling modules are importable via sys.path bootstrap.
-Tests load this file via importlib and expect re-exports of public symbols.
+When run as a script, sibling modules are importable via sys.path
+bootstrap. Tests load this file via importlib and expect re-exports of
+public symbols.
 """
 
 from __future__ import annotations
@@ -20,22 +21,6 @@ _PKG_DIR = Path(__file__).resolve().parent
 if str(_PKG_DIR) not in sys.path:
     sys.path.insert(0, str(_PKG_DIR))
 
-from config import (  # noqa: E402
-    ALLOWLIST_PATH,
-    CONTEXT_LINES,
-    FOCUSED_TARGET_BATCHES,
-    GEMINI_MODELS,
-    GEMINI_MODEL_QUOTAS,
-    MAX_ATTEMPTS,
-    MAX_QUOTA_RETRIES,
-    MAX_REVIEW_CHARS,
-    PACKED_MAX_CHUNKS_PER_BATCH,
-    SHORT_FILE_MAX_CHARS,
-    SHORT_FILE_MAX_CHUNKS,
-    STRING_VALUE_LINE_RE,
-    gemini_endpoint,
-    min_request_interval_sec,
-)
 from diff_parser import (  # noqa: E402
     _compact_review_entry,
     _escape_review_value,
@@ -49,6 +34,7 @@ from gemini_client import (  # noqa: E402
     active_model_id,
     active_model_quota,
     call_gemini,
+    is_daily_quota_error,
     pace_after_model_failover,
     reset_model_failover_state,
     try_advance_model,
@@ -66,7 +52,7 @@ from report_formatter import (  # noqa: E402
     print_usage_summary,
     record_model_usage,
 )
-from response_processor import (  # noqa: E402
+from response_processor import (
     assert_generation_complete,
     attach_locations,
     dedupe_issues,
@@ -75,10 +61,15 @@ from response_processor import (  # noqa: E402
     filter_placeholder_mismatches,
     filter_userfacing_issues,
     load_allowlist,
+    allowlist_original_matches,
     normalize_issue_to_string_value,
     parse_model_json,
     placeholders,
+)
+from response_processor import (  # noqa: E402
     postprocess_issues as _postprocess_issues_impl,
+)
+from response_processor import (
     strip_markdown_fence,
     validate_result,
 )
@@ -90,6 +81,26 @@ from review_batcher import (  # noqa: E402
     split_into_batches,
     split_text_for_limit,
     with_batch_continuation_header,
+)
+
+from config import (  # noqa: E402
+    ALLOWLIST_PATH,
+    CONTEXT_LINES,
+    FOCUSED_TARGET_BATCHES,
+    GEMINI_MODEL_QUOTAS,
+    GEMINI_MODELS,
+    MAX_ATTEMPTS,
+    MAX_QUOTA_RETRIES,
+    MAX_REVIEW_CHARS,
+    PACKED_MAX_CHUNKS_PER_BATCH,
+    SEVERITY_HIGH,
+    SEVERITY_LOW,
+    SEVERITY_MEDIUM,
+    SHORT_FILE_MAX_CHARS,
+    SHORT_FILE_MAX_CHUNKS,
+    STRING_VALUE_LINE_RE,
+    gemini_endpoint,
+    min_request_interval_sec,
 )
 
 # Re-export for tests / monkeypatch targets.
@@ -111,6 +122,7 @@ __all__ = [
     "_peek_triple_quoted_string",
     "active_model_id",
     "active_model_quota",
+    "allowlist_original_matches",
     "analyze_diff",
     "assert_generation_complete",
     "attach_locations",
@@ -129,6 +141,7 @@ __all__ = [
     "format_usage_lines",
     "gemini_endpoint",
     "has_blocking_issues",
+    "is_daily_quota_error",
     "load_allowlist",
     "main",
     "max_chunks_per_batch_for_file",
@@ -166,17 +179,20 @@ Multiline VALUES encode embedded newlines as \\n (one line under the header).
 
 Rules:
 1) original/suggestion = VALUE only — never whole KEY lines or bare "KEY =" / "KEY:".
-2) Identifier/key typos MAY be reported at severity "low" only.
+2) Identifier/key typos MAY be reported at severity "{SEVERITY_LOW}" only.
 3) IGNORE syntax (commas, braces, multiline KEY then value — that is valid).
 4) Keep placeholders identical ({{...}}, %s/%d, ${{...}}, Python {{}}). Never invent/remove them.
-5) Leading/trailing whitespace style → severity "low" only (never high/medium).
+5) Leading/trailing whitespace style → severity "{SEVERITY_LOW}" only (never {SEVERITY_HIGH}/{SEVERITY_MEDIUM}).
 6) Inspect EVERY VALUE carefully (character-level spelling/grammar/wrong words,
    including Chinese character mistakes, wrong characters, and incorrect word usage).
    Do not skip entries.
+7) Punctuation-only (comma splice, comma vs colon), incomplete UI labels, and domain-term
+   preference → severity "{SEVERITY_MEDIUM}" only (never {SEVERITY_HIGH}).
 Ignore imports, URLs, paths, UUIDs, hashes, debug/internal comments.
 
-Severity (lowercase): high = VALUE spelling/grammar/wrong word; medium = wording;
-low = VALUE casing/whitespace style OR identifier/key typos. Only high blocks merge.
+Severity (lowercase): {SEVERITY_HIGH} = VALUE spelling / wrong character / wrong word that
+changes meaning; {SEVERITY_MEDIUM} = wording or punctuation preference;
+{SEVERITY_LOW} = VALUE casing/whitespace style OR identifier/key typos. Only {SEVERITY_HIGH} blocks merge.
 
 Return JSON only (schema enforced by API). Empty → {{"has_issue": false, "issues": []}}.
 
@@ -190,9 +206,12 @@ def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
     if not isinstance(meta, dict):
         return {}
     mapping = {
-        "promptTokenCount": "prompt", "prompt_token_count": "prompt",
-        "candidatesTokenCount": "candidates", "candidates_token_count": "candidates",
-        "totalTokenCount": "total", "total_token_count": "total",
+        "promptTokenCount": "prompt",
+        "prompt_token_count": "prompt",
+        "candidatesTokenCount": "candidates",
+        "candidates_token_count": "candidates",
+        "totalTokenCount": "total",
+        "total_token_count": "total",
     }
     out: dict[str, int] = {}
     for src, dst in mapping.items():
@@ -205,19 +224,32 @@ def extract_usage_counts(api_payload: dict[str, Any]) -> dict[str, int]:
 
 
 def postprocess_issues(
-    issues: list[dict[str, Any]], added_details: dict[str, list[dict[str, Any]]],
+    issues: list[dict[str, Any]],
+    added_details: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Façade: resolve allowlist via this module so tests can patch load_allowlist."""
+    """Façade: resolve allowlist via this module so tests can patch
+    load_allowlist."""
     return _postprocess_issues_impl(
-        issues, added_details, allowlist_entries=load_allowlist(),
+        issues,
+        added_details,
+        allowlist_entries=load_allowlist(),
     )
 
 
 def review_by_file_sessions(
-    api_key: str, review_by_file: dict[str, str],
+    api_key: str,
+    review_by_file: dict[str, str],
 ) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
-    """Per-file Gemini sessions. Uses module-level call_gemini for monkeypatch."""
-    all_issues, total_duration, stats, last_request_at = [], 0.0, empty_usage_stats(), 0.0
+    """Per-file Gemini sessions.
+
+    Uses module-level call_gemini for monkeypatch.
+    """
+    all_issues, total_duration, stats, last_request_at = (
+        [],
+        0.0,
+        empty_usage_stats(),
+        0.0,
+    )
     wall_t0 = time.monotonic()
     first_request_at = 0.0
     for path, text in review_by_file.items():
@@ -241,7 +273,10 @@ def review_by_file_sessions(
         for i, raw_batch in enumerate(batches):
             batch = with_batch_continuation_header(path, raw_batch, batch_index=i)
             if len(batches) > 1:
-                print(f"  batch {i + 1}/{len(batches)}: {len(batch)} chars", file=sys.stderr)
+                print(
+                    f"  batch {i + 1}/{len(batches)}: {len(batch)} chars",
+                    file=sys.stderr,
+                )
             quota = active_model_quota()
             interval = min_request_interval_sec(quota.rpm)
             if last_request_at > 0:
@@ -273,7 +308,9 @@ def review_by_file_sessions(
     if stats["requests"] > 0:
         stats["wall_sec"] = time.monotonic() - wall_t0
         stats["effective_rpm"] = compute_effective_rpm(
-            stats["requests"], first_request_at, last_request_at,
+            stats["requests"],
+            first_request_at,
+            last_request_at,
         )
     print_usage_summary(stats)
     return all_issues, total_duration, stats
@@ -283,7 +320,9 @@ def empty_result(files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {"has_issue": False, "issues": [], "files": files or []}
 
 
-def fail(message: str, *, summary: str | None = None, result: dict[str, Any] | None = None) -> int:
+def fail(
+    message: str, *, summary: str | None = None, result: dict[str, Any] | None = None
+) -> int:
     print(message, file=sys.stderr)
     if summary:
         append_step_summary(summary)
@@ -293,8 +332,11 @@ def fail(message: str, *, summary: str | None = None, result: dict[str, Any] | N
 
 def _passed_summary(extra_note: str, files: list[dict[str, Any]] | None = None) -> str:
     return format_step_summary(
-        status="PASSED", issues=[], duration_sec=None,
-        extra_note=extra_note, files=files or [],
+        status="PASSED",
+        issues=[],
+        duration_sec=None,
+        extra_note=extra_note,
+        files=files or [],
     )
 
 
@@ -312,8 +354,13 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         return fail(f"Failed to read diff file: {exc}")
     if not diff_text.strip():
-        print("No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API", file=sys.stderr)
-        append_step_summary(_passed_summary("Out of path scope / empty diff — Gemini API not called"))
+        print(
+            "No changes under LOCALIZATION_GATE_PATHSPECS — skip Gemini API",
+            file=sys.stderr,
+        )
+        append_step_summary(
+            _passed_summary("Out of path scope / empty diff — Gemini API not called")
+        )
         print_result_json(empty_result())
         return 0
     analyzed = analyze_diff(diff_text)
@@ -323,13 +370,21 @@ def main(argv: list[str] | None = None) -> int:
     if files:
         print("Diff scope:", file=sys.stderr)
         for item in files:
-            print(f"  {item['path']}  +{item['added']} -{item['deleted']}", file=sys.stderr)
+            print(
+                f"  {item['path']}  +{item['added']} -{item['deleted']}",
+                file=sys.stderr,
+            )
     else:
         print("Diff scope: (no files)", file=sys.stderr)
 
     if not any(text.strip() for text in review_by_file.values()):
-        print("No added lines to review under scoped diff — skip Gemini API", file=sys.stderr)
-        append_step_summary(_passed_summary("No added lines — Gemini API not called", files))
+        print(
+            "No added lines to review under scoped diff — skip Gemini API",
+            file=sys.stderr,
+        )
+        append_step_summary(
+            _passed_summary("No added lines — Gemini API not called", files)
+        )
         print_result_json(empty_result(files))
         return 0
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -337,29 +392,42 @@ def main(argv: list[str] | None = None) -> int:
         return fail(
             "GEMINI_API_KEY is missing",
             summary=format_step_summary(
-                status="FAILED", issues=[], duration_sec=None,
-                extra_note="GEMINI_API_KEY is missing", files=files,
+                status="FAILED",
+                issues=[],
+                duration_sec=None,
+                extra_note="GEMINI_API_KEY is missing",
+                files=files,
             ),
             result=empty_result(files),
         )
     try:
-        raw_issues, duration, usage_stats = review_by_file_sessions(api_key, review_by_file)
+        raw_issues, duration, usage_stats = review_by_file_sessions(
+            api_key, review_by_file
+        )
         kept = postprocess_issues(raw_issues, added_details)
         result = {"has_issue": bool(kept), "issues": kept, "files": files}
     except (ValueError, RuntimeError, OSError, requests.RequestException) as exc:
         return fail(
             f"Localization gate failed: {exc}",
             summary=format_step_summary(
-                status="FAILED", issues=[], duration_sec=None,
-                extra_note=f"fail-closed: {exc}", files=files,
+                status="FAILED",
+                issues=[],
+                duration_sec=None,
+                extra_note=f"fail-closed: {exc}",
+                files=files,
             ),
             result=empty_result(files),
         )
-    append_step_summary(format_step_summary(
-        status="FAILED" if has_blocking_issues(kept) else "PASSED",
-        issues=kept, duration_sec=duration,
-        usage=format_usage_summary(usage_stats), usage_stats=usage_stats, files=files,
-    ))
+    append_step_summary(
+        format_step_summary(
+            status="FAILED" if has_blocking_issues(kept) else "PASSED",
+            issues=kept,
+            duration_sec=duration,
+            usage=format_usage_summary(usage_stats),
+            usage_stats=usage_stats,
+            files=files,
+        )
+    )
     print_result_json(result)
     if has_blocking_issues(kept):
         print("Blocking HIGH severity issues found", file=sys.stderr)

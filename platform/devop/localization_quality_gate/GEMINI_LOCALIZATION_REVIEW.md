@@ -9,7 +9,9 @@ PR quality gate for user-facing text (English / Simplified Chinese / Portuguese)
 | Component | Path |
 | --- | --- |
 | Workflow (sole path-allowlist source) | [`.github/workflows/localization-quality-gate.yml`](../../../.github/workflows/localization-quality-gate.yml) |
-| Review script | [`localization_quality_gate.py`](./localization_quality_gate.py) |
+| CLI entry (facade) | [`localization_quality_gate.py`](./localization_quality_gate.py) |
+| Implementation modules | [`config.py`](./config.py), [`diff_parser.py`](./diff_parser.py), [`gemini_client.py`](./gemini_client.py), [`review_batcher.py`](./review_batcher.py), [`response_processor.py`](./response_processor.py), [`report_formatter.py`](./report_formatter.py), [`models.py`](./models.py) |
+| False-positive allowlist | [`allowlist.json`](./allowlist.json) |
 | Unit tests | [`test_localization_quality_gate.py`](./test_localization_quality_gate.py) |
 
 ## Secret
@@ -110,7 +112,7 @@ When the model marks HIGH but the copy is intentional, add an entry to [`allowli
 ]
 ```
 
-- `original` (required): exact match on the issue VALUE
+- `original` (required): exact VALUE, or a domain term inside the VALUE (CJK substring, e.g. `采像`; ASCII as a whole word, e.g. `IPC` not `IPConfig`)
 - `file` (optional): when set, issue path must equal or end with this suffix
 
 ## Model failover
@@ -129,7 +131,7 @@ The API key is sent via the `x-goog-api-key` header.
 
 ## Results and required check
 
-1. Open the PR → **Checks** → `Localization Quality Gate`
+1. Open the PR → **Checks** → `Localization Quality Gate` / `Localization Quality Gate Required`
 2. Job log for JSON; **Summary** tab for the Markdown report
 
-Under branch protection → Require status checks, enable **`Localization Quality Gate`** (must match the workflow `name`).
+Under branch protection → Require status checks, enable **`Localization Quality Gate Required`** (must match the required aggregator job `name`).
