@@ -224,3 +224,6 @@ VALIDATE_25D_OPTIX_LFOV_DUAL_MODE_TOO_MANY_SECTIONS_ERROR = (
     "环{ring_number}中的模式{pattern_index}激活了超过两个部分。"
     "双模式条形灯设置只允许同时激活两个相邻的部分。"
 )
+PRODUCTION_PY_DUPLICATE_CAPTURE_CONFIG = (
+    "/home/unitx/unitx_data/config/production.py 不能使用重复的采像设置"
+)
