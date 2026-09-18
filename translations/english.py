@@ -9,7 +9,7 @@ DOCKER_CONTAINER_NOT_RUNNING = "Software dependency container error. Try restart
 ERROR_FILE_PROPERTIES_NOT_FOUND = "{} not existed"
 CONTROLLER_CAPTURE_NAME_INVALID = "The capture names '{capture_names}' are configured incorrectly and are not exist in OptiX's db, please check the config in OptiX."
 GLOBAL_CONFIG_DESCRIPTION_DISK_SPACE_HARD_LIMIT_GB = (
-    "When the remaining disk space falls below this value (default 200G), ProdX stops running and prompt "
+    "When the remaining disk space falls below this value (default 200G), ProdX stops running and prompts "
     "that disk space is critically low."
 )
 GLOBAL_CONFIG_DESCRIPTION_TROUBLE_SHOOTING_TASK_GRAPH_STEPS_TIMEOUT_MS = (
@@ -39,3 +39,9 @@ GLOBAL_CONFIG_DESCRIPTION_USE_GAMMA_CORRECT = (
 )
 GLOBAL_CONFIG_LABEL_ENABLE_MULTITHREAD_CORTEX_POSTPROCESS = "Multi-threaded of model"
 GLOBAL_CONFIG_DESCRIPTION_ENABLE_CUSTOM_CSV = "When enabled, PRODX will enable the storage of image and material data to CSV files, default is disabled."
+GLOBAL_CONFIG_DESCRIPTION_IMAGE_PROCESS_TIMEOUT_MS = (
+    "When there are too many images of 1 part, the processing time can be lengthy, and the system may not complete processing "
+    "before the camera resets. This value(default 500ms) indicates the tolerance after the camera resets if image "
+    "processing is still not finished. Only when this time is exceeded will it be judged as a processing timeout."
+)
+MEMORY_TIMEOUT_ERROR = "Get shared memory {name} timeout. Please restart ProdX software"
