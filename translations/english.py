@@ -39,3 +39,5 @@ GLOBAL_CONFIG_DESCRIPTION_USE_GAMMA_CORRECT = (
 )
 GLOBAL_CONFIG_LABEL_ENABLE_MULTITHREAD_CORTEX_POSTPROCESS = "Multi-threaded of model"
 GLOBAL_CONFIG_DESCRIPTION_ENABLE_CUSTOM_CSV = "When enabled, PRODX will enable the storage of image and material data to CSV files, default is disabled."
+# SWE-18551 verify phantom locale on base
+VERIFY_THREE_DOT_PHANTOM = "Please inpute the secrt key to activete product"
