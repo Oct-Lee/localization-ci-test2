@@ -79,6 +79,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE_SHA="${{ github.event.pull_request.base.sha }}"
             HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            echo "PR run: three-dot diff ${BASE_SHA}...${HEAD_SHA}"
           else
             BASE_REF="${{ inputs.base_ref }}"
             if [ -z "${BASE_REF}" ]; then
@@ -87,12 +88,14 @@ jobs:
             git fetch origin "${BASE_REF}"
             BASE_SHA="$(git merge-base "origin/${BASE_REF}" HEAD)"
             HEAD_SHA="${{ github.sha }}"
-            echo "Manual run: diff ${BASE_SHA} (merge-base of origin/${BASE_REF})...${HEAD_SHA}"
+            echo "Manual run: three-dot diff ${BASE_SHA}...${HEAD_SHA} (merge-base of origin/${BASE_REF})"
           fi
 
+          # Three-dot diff matches GitHub PR Files (merge-base...head).
+          # Two-dot base..head falsely includes locale changes from main when
+          # the PR branch is behind.
           git diff \
-            "${BASE_SHA}" \
-            "${HEAD_SHA}" \
+            "${BASE_SHA}...${HEAD_SHA}" \
             --unified=0 \
             -- ${LOCALIZATION_GATE_PATHSPECS} \
             > pr.diff
